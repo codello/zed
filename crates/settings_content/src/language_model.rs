@@ -580,6 +580,7 @@ pub struct OpenRouterSettingsContent {
     pub api_url: Option<String>,
     pub available_models: Option<Vec<OpenRouterAvailableModel>>,
     pub custom_headers: Option<HashMap<String, String>>,
+    pub provider: Option<OpenRouterProvider>,
 }
 
 #[with_fallible_options]
@@ -587,9 +588,7 @@ pub struct OpenRouterSettingsContent {
 pub struct OpenRouterAvailableModel {
     pub name: String,
     pub display_name: Option<String>,
-    pub max_tokens: u64,
-    pub max_output_tokens: Option<u64>,
-    pub max_completion_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
     pub supports_tools: Option<bool>,
     pub supports_images: Option<bool>,
     pub mode: Option<ModelMode>,
@@ -600,16 +599,60 @@ pub struct OpenRouterAvailableModel {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct OpenRouterProvider {
     order: Option<Vec<String>>,
-    #[serde(default = "default_true")]
-    allow_fallbacks: bool,
-    #[serde(default)]
-    require_parameters: bool,
-    #[serde(default)]
-    data_collection: DataCollection,
+    allow_fallbacks: Option<bool>,
+    require_parameters: Option<bool>,
+    data_collection: Option<DataCollection>,
+    zdr: Option<bool>,
     only: Option<Vec<String>>,
     ignore: Option<Vec<String>>,
     quantizations: Option<Vec<String>>,
-    sort: Option<String>,
+    sort: Option<OpenRouterSort>,
+    /// Can be a number (applies to p50) or an object with percentile cutoffs.
+    preferred_min_throughput: Option<OpenRouterThreshold>,
+    /// Can be a number (applies to p50) or an object with percentile cutoffs.
+    preferred_max_latency: Option<OpenRouterThreshold>,
+    max_price: Option<OpenRouterMaxPrice>,
+}
+
+impl OpenRouterProvider {
+    pub fn merge_with_defaults(&mut self, defaults: &Self) {
+        if self.order.is_none() {
+            self.order = defaults.order.clone();
+        }
+        if self.allow_fallbacks.is_none() {
+            self.allow_fallbacks = defaults.allow_fallbacks;
+        }
+        if self.require_parameters.is_none() {
+            self.require_parameters = defaults.require_parameters;
+        }
+        if self.data_collection.is_none() {
+            self.data_collection = defaults.data_collection.clone();
+        }
+        if self.zdr.is_none() {
+            self.zdr = defaults.zdr;
+        }
+        if self.only.is_none() {
+            self.only = defaults.only.clone();
+        }
+        if self.ignore.is_none() {
+            self.ignore = defaults.ignore.clone();
+        }
+        if self.quantizations.is_none() {
+            self.quantizations = defaults.quantizations.clone();
+        }
+        if self.sort.is_none() {
+            self.sort = defaults.sort.clone();
+        }
+        if self.preferred_min_throughput.is_none() {
+            self.preferred_min_throughput = defaults.preferred_min_throughput.clone();
+        }
+        if self.preferred_max_latency.is_none() {
+            self.preferred_max_latency = defaults.preferred_max_latency.clone();
+        }
+        if self.max_price.is_none() {
+            self.max_price = defaults.max_price.clone();
+        }
+    }
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
@@ -618,6 +661,44 @@ pub enum DataCollection {
     #[default]
     Allow,
     Disallow,
+}
+
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenRouterSort {
+    #[default]
+    Price,
+    Throughput,
+    Latency,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(untagged)]
+pub enum OpenRouterThreshold {
+    Value(f64),
+    Percentiles(OpenRouterThresholdPercentiles),
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct OpenRouterThresholdPercentiles {
+    pub p50: Option<f64>,
+    pub p75: Option<f64>,
+    pub p90: Option<f64>,
+    pub p99: Option<f64>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct OpenRouterMaxPrice {
+    /// Max price per million input tokens.
+    pub prompt: Option<f64>,
+    /// Max price per million output tokens.
+    pub completion: Option<f64>,
+    /// Max price per image.
+    pub image: Option<f64>,
+    /// Max price per request (if the provider supports it).
+    pub request: Option<f64>,
 }
 
 fn default_true() -> bool {

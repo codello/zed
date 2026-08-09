@@ -168,6 +168,7 @@ impl settings::Settings for AllLanguageModelSettings {
                     open_router.custom_headers,
                     open_router::RESERVED_HEADER_NAMES,
                 ),
+                provider: open_router.provider,
             },
             openai: OpenAiSettings {
                 api_url: openai.api_url.unwrap(),

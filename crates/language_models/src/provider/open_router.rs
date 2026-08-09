@@ -15,10 +15,14 @@ use language_model::{
 use open_router::{
     Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ResponseStreamEvent, list_models,
 };
-use settings::{OpenRouterAvailableModel as AvailableModel, Settings, SettingsStore};
+use settings::{
+    OpenRouterAvailableModel as AvailableModel, OpenRouterProvider as AvailableModelProvider,
+    Settings, SettingsStore,
+};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use ui::IconName;
+use util::default;
 
 use language_model::util::{fix_streamed_json, parse_tool_arguments};
 
@@ -35,6 +39,7 @@ pub struct OpenRouterSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
     pub custom_headers: CustomHeaders,
+    pub provider: Option<AvailableModelProvider>,
 }
 
 pub struct OpenRouterLanguageModelProvider {
@@ -217,29 +222,48 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
+        let settings = Self::settings(cx);
+        let default_provider = settings.provider.clone();
         let mut models_from_api = self.state.read(cx).available_models.clone();
-        let mut settings_models = Vec::new();
+        let settings_models = &settings.available_models;
 
-        for model in &Self::settings(cx).available_models {
-            settings_models.push(open_router::Model {
-                name: model.name.clone(),
-                display_name: model.display_name.clone(),
-                max_tokens: model.max_tokens,
-                supports_tools: model.supports_tools,
-                supports_images: model.supports_images,
-                mode: model.mode.unwrap_or_default(),
-                provider: model.provider.clone(),
-            });
+        for settings_model in settings_models {
+            let existing_pos = models_from_api
+                .iter()
+                .position(|m| m.name == settings_model.name);
+
+            let base = match existing_pos {
+                Some(pos) => models_from_api[pos].clone(),
+                None => open_router::Model {
+                    name: settings_model.name.clone(),
+                    display_name: Some(settings_model.name.clone()),
+                    ..default()
+                },
+            };
+
+            let merged_model = open_router::Model {
+                name: settings_model.name.clone(),
+                display_name: settings_model.display_name.clone().or(base.display_name),
+                max_tokens: settings_model.max_tokens.unwrap_or(base.max_tokens),
+                supports_tools: settings_model.supports_tools.or(base.supports_tools),
+                supports_images: settings_model.supports_images.or(base.supports_images),
+                mode: settings_model.mode.unwrap_or(base.mode),
+                provider: settings_model.provider.clone().or(base.provider),
+            };
+
+            match existing_pos {
+                Some(pos) => models_from_api[pos] = merged_model,
+                None => models_from_api.push(merged_model),
+            }
         }
 
-        for settings_model in &settings_models {
-            if let Some(pos) = models_from_api
-                .iter()
-                .position(|m| m.name == settings_model.name)
-            {
-                models_from_api[pos] = settings_model.clone();
-            } else {
-                models_from_api.push(settings_model.clone());
+        if let Some(default_provider) = &default_provider {
+            for model in &mut models_from_api {
+                if let Some(model_provider) = &mut model.provider {
+                    model_provider.merge_with_defaults(default_provider);
+                } else {
+                    model.provider = Some(default_provider.clone());
+                }
             }
         }
 

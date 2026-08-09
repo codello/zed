@@ -72,14 +72,20 @@ Custom model entries support fields such as `name`, `display_name`, `max_tokens`
 
 ### OpenRouter Provider Routing {#openrouter-provider-routing}
 
-You can control how OpenRouter routes a custom model request among upstream providers with the `provider` object on each model entry.
+You can control how OpenRouter routes a request among upstream providers with the `provider` object.
 
-Supported fields include `order`, `allow_fallbacks`, `require_parameters`, `data_collection`, `only`, `ignore`, `quantizations`, and `sort`.
+Supported fields include `order`, `allow_fallbacks`, `require_parameters`, `data_collection`, `zdr`, `only`, `ignore`, `quantizations`, `sort`, `preferred_min_throughput`, `preferred_max_latency`, and `max_price`. See OpenRouter's [provider routing guide](https://openrouter.ai/docs/guides/routing/provider-selection) for the full semantics of each field.
+
+You can set a `provider` object at the top level of the `open_router` settings to apply default routing preferences to every model that doesn't define its own `provider`. Per-model `provider` entries take precedence over this default:
 
 ```json [settings]
 {
   "language_models": {
     "open_router": {
+      "provider": {
+        "sort": "throughput",
+        "data_collection": "deny"
+      },
       "available_models": [
         {
           "name": "openrouter/auto",
@@ -90,7 +96,8 @@ Supported fields include `order`, `allow_fallbacks`, `require_parameters`, `data
             "order": ["anthropic", "openai"],
             "allow_fallbacks": true,
             "require_parameters": true,
-            "data_collection": "allow"
+            "preferred_max_latency": { "p90": 3 },
+            "max_price": { "prompt": 1, "completion": 2 }
           }
         }
       ]
@@ -98,6 +105,8 @@ Supported fields include `order`, `allow_fallbacks`, `require_parameters`, `data
   }
 }
 ```
+
+In this example, every model uses the top-level default values (`sort: "throughput"`, `data_collection: "deny"`). The `openrouter/auto` model adds its own `provider` settings (with `order`, `allow_fallbacks`, etc.) to the top-level defaults.
 
 ## Vercel AI Gateway {#vercel-ai-gateway}
 
