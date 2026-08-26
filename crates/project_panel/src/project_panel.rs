@@ -310,6 +310,7 @@ struct EntryDetails {
     git_status: GitSummary,
     is_private: bool,
     worktree_id: WorktreeId,
+    worktree_name: Option<String>,
     canonical_path: Option<Arc<Path>>,
 }
 
@@ -5455,6 +5456,7 @@ impl ProjectPanel {
             {
                 let snapshot = worktree.read(cx).snapshot();
                 let root_name = snapshot.root_name();
+                let main_worktree_name = snapshot.main_worktree_name();
 
                 let entry_range = range.start.saturating_sub(ix)..end_ix - ix;
                 let entries = visible
@@ -5472,6 +5474,7 @@ impl ProjectPanel {
                         entries,
                         status,
                         None,
+                        main_worktree_name.as_deref(),
                         window,
                         cx,
                     );
@@ -5944,6 +5947,7 @@ impl ProjectPanel {
             .is_some_and(|selection| selection.entry_id == entry_id);
 
         let file_name = details.filename.clone();
+        let worktree_name = details.worktree_name.clone();
 
         let chevron = details.chevron.clone();
         let mut icon = details.icon.clone();
@@ -6615,13 +6619,25 @@ impl ProjectPanel {
                                 }
 
                                 None => this.child(
-                                    Label::new(file_name)
-                                        .single_line()
-                                        .color(filename_text_color)
-                                        .when(
-                                            settings.bold_folder_labels && kind.is_dir(),
-                                            |this| this.weight(FontWeight::SEMIBOLD),
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Label::new(file_name)
+                                                .single_line()
+                                                .color(filename_text_color)
+                                                .when(
+                                                    settings.bold_folder_labels && kind.is_dir(),
+                                                    |this| this.weight(FontWeight::SEMIBOLD),
+                                                ),
                                         )
+                                        .when_some(worktree_name, |this, worktree_name| {
+                                            this.child(
+                                                Label::new(worktree_name)
+                                                    .single_line()
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Hidden),
+                                            )
+                                        })
                                         .into_any_element(),
                                 ),
                             })
@@ -6886,6 +6902,7 @@ impl ProjectPanel {
         entries_paths: &HashSet<Arc<RelPath>>,
         git_status: GitSummary,
         sticky: Option<StickyDetails>,
+        main_worktree_name: Option<&str>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> EntryDetails {
@@ -6926,7 +6943,12 @@ impl ProjectPanel {
         let (depth, difference) =
             ProjectPanel::calculate_depth_and_difference(entry, entries_paths);
 
-        let filename = if difference > 1 {
+        let is_root_entry = entry.path.file_name().is_none();
+        let filename = if let Some(main_worktree_name) = main_worktree_name
+            && is_root_entry
+        {
+            main_worktree_name.to_string()
+        } else if difference > 1 {
             entry
                 .path
                 .last_n_components(difference)
@@ -6941,6 +6963,8 @@ impl ProjectPanel {
                 .unwrap_or_else(|| root_name.as_unix_str().to_string())
         };
 
+        let worktree_name = (main_worktree_name.is_some() && is_root_entry)
+            .then_some(root_name.as_unix_str().to_string());
         let selection = SelectedEntry {
             worktree_id,
             entry_id: entry.id,
@@ -7014,6 +7038,7 @@ impl ProjectPanel {
             git_status,
             is_private: entry.is_private,
             worktree_id,
+            worktree_name,
             canonical_path: entry.canonical_path.clone(),
         }
     }
@@ -7216,6 +7241,7 @@ impl ProjectPanel {
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let git_status_enabled = panel_settings.git_status;
         let root_name = worktree.root_name();
+        let main_worktree_name = worktree.main_worktree_name();
 
         let git_summaries_by_id = if git_status_enabled {
             visible
@@ -7248,6 +7274,7 @@ impl ProjectPanel {
                     paths,
                     git_status,
                     sticky_details,
+                    main_worktree_name.as_deref(),
                     window,
                     cx,
                 );

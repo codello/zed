@@ -9191,17 +9191,12 @@ impl Repository {
         worktree_directory_setting: &str,
     ) -> Result<PathBuf> {
         let repository_anchor = self.linked_worktree_anchor_path();
-        let project_name = repository_anchor
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("git repo must have a directory name"))?;
         let directory = worktrees_directory_for_repo(
             repository_anchor,
             worktree_directory_setting,
             self.path_style,
         )?;
-        let directory = self.path_style.join_path(&directory, branch_name)?;
-        self.path_style.join_path(&directory, project_name)
+        self.path_style.join_path(&directory, branch_name)
     }
 
     pub fn worktrees(&mut self) -> oneshot::Receiver<Result<Vec<GitWorktree>>> {
