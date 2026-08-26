@@ -6335,17 +6335,12 @@ impl RepositorySnapshot {
         worktree_directory_setting: &str,
     ) -> Result<PathBuf> {
         let repository_anchor = self.linked_worktree_anchor_path();
-        let project_name = self
-            .path_style
-            .file_name(repository_anchor)
-            .ok_or_else(|| anyhow!("git repo must have a directory name"))?;
         let directory = worktrees_directory_for_repo(
             repository_anchor,
             worktree_directory_setting,
             self.path_style,
         )?;
-        let directory = self.path_style.join_path(&directory, worktree_name)?;
-        self.path_style.join_path(&directory, project_name)
+        self.path_style.join_path(&directory, worktree_name)
     }
 
     /// The main worktree is the original checkout that other worktrees were
@@ -12366,7 +12361,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             path,
-            PathBuf::from(r"C:\Users\user\dev\worktrees\lsp-tests\nimble-sky\lsp-tests")
+            PathBuf::from(r"C:\Users\user\dev\worktrees\lsp-tests\nimble-sky")
         );
     }
 
@@ -12394,7 +12389,7 @@ mod tests {
             snapshot
                 .path_for_new_linked_worktree("nimble-sky", "../worktrees")
                 .unwrap(),
-            PathBuf::from(r"C:\Users\user\dev\worktrees\lsp-tests\nimble-sky\lsp-tests")
+            PathBuf::from(r"C:\Users\user\dev\worktrees\lsp-tests\nimble-sky")
         );
     }
 

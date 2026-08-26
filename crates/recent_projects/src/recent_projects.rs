@@ -237,7 +237,11 @@ fn get_open_folders(workspace: &Workspace, cx: &App) -> Vec<OpenFolderEntry> {
             let worktree_id = worktree_ref.id();
             let path = worktree_ref.abs_path().to_path_buf();
             let detail = path_detail_map.get(&path).copied().unwrap_or(0);
-            let name = SharedString::from(project::path_suffix(&path, detail));
+            let name = worktree_ref
+                .snapshot()
+                .main_worktree_name()
+                .map(SharedString::from)
+                .unwrap_or_else(|| SharedString::from(project::path_suffix(&path, detail)));
             let branch = get_branch_for_worktree(worktree_ref, &repositories, cx);
             let is_active = active_worktree_id == Some(worktree_id);
             OpenFolderEntry {
