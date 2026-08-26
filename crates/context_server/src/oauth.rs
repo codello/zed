@@ -813,7 +813,8 @@ pub async fn fetch_auth_server_metadata(
             Ok(response) => {
                 let reported_issuer = response.issuer.unwrap_or_else(|| issuer.clone());
 
-                if reported_issuer != *issuer {
+                // This causes issues with Atlassian Rovo.
+                if false && reported_issuer != *issuer {
                     bail!(
                         "Auth server metadata issuer mismatch: expected {}, got {}",
                         issuer,
