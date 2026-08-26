@@ -2573,6 +2573,20 @@ impl Snapshot {
         self.root_repo_is_linked_worktree
     }
 
+    pub fn main_worktree_name(&self) -> Option<String> {
+        if !self.root_repo_is_linked_worktree() {
+            return None;
+        }
+        let common_dir = self.root_repo_common_dir()?;
+        if common_dir.file_name() != Some(std::ffi::OsStr::new(".git")) {
+            return None;
+        }
+        common_dir
+            .parent()?
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+
     fn build_initial_update(&self, project_id: u64, worktree_id: u64) -> proto::UpdateWorktree {
         let mut updated_entries = self
             .entries_by_path
