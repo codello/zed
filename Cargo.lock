@@ -9771,6 +9771,7 @@ dependencies = [
  "language",
  "language_model",
  "language_models_cloud",
+ "litellm",
  "llama_cpp",
  "lmstudio",
  "log",
@@ -10173,6 +10174,24 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "litellm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.34",
+ "gpui",
+ "gpui_tokio",
+ "http_client",
+ "language_model_core",
+ "reqwest_client",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+]
 
 [[package]]
 name = "litemap"

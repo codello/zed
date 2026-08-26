@@ -2664,6 +2664,9 @@
     "open_router": {
       "api_url": "https://openrouter.ai/api/v1",
     },
+    "litellm": {
+      "api_url": "https://aikeys.maibornwolff.de",
+    },
     "lmstudio": {
       "api_url": "http://localhost:1234/api/v0",
     },

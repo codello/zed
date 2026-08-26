@@ -15,6 +15,7 @@ pub struct AllLanguageModelSettingsContent {
     pub bedrock: Option<AmazonBedrockSettingsContent>,
     pub deepseek: Option<DeepseekSettingsContent>,
     pub google: Option<GoogleSettingsContent>,
+    pub litellm: Option<LiteLlmSettingsContent>,
     #[serde(rename = "llama.cpp")]
     pub llama_cpp: Option<LlamaCppSettingsContent>,
     pub lmstudio: Option<LmStudioSettingsContent>,
@@ -569,6 +570,12 @@ pub enum ZedDotDevAvailableProvider {
     Anthropic,
     OpenAi,
     Google,
+}
+
+#[with_fallible_options]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+pub struct LiteLlmSettingsContent {
+    pub api_url: Option<String>,
 }
 
 #[with_fallible_options]
