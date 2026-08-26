@@ -671,9 +671,11 @@ pub struct TurnFields {
     pub _turn_timer_task: Option<Task<()>>,
     pub last_turn_duration: Option<Duration>,
     pub last_turn_tokens: Option<u64>,
+    pub last_turn_cache_writes: Option<u64>,
     pub turn_generation: usize,
     pub turn_started_at: Option<Instant>,
     pub turn_tokens: Option<u64>,
+    pub turn_cache_writes: Option<u64>,
     pub reported_activity_generation: Option<u64>,
 }
 
@@ -1454,7 +1456,9 @@ impl ThreadView {
         self.turn_fields.turn_started_at = Some(Instant::now());
         self.turn_fields.last_turn_duration = None;
         self.turn_fields.last_turn_tokens = None;
+        self.turn_fields.last_turn_cache_writes = None;
         self.turn_fields.turn_tokens = Some(0);
+        self.turn_fields.turn_cache_writes = Some(0);
         self.turn_fields._turn_timer_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -1476,6 +1480,8 @@ impl ThreadView {
             .take()
             .map(|started| started.elapsed());
         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
+        self.turn_fields.last_turn_cache_writes =
+            self.turn_fields.turn_cache_writes.take().filter(|&n| n > 0);
         self.turn_fields._turn_timer_task = None;
     }
 
@@ -1739,6 +1745,14 @@ impl ThreadView {
             if let Some(tokens) = &mut self.turn_fields.turn_tokens {
                 *tokens += usage.output_tokens;
                 self.emit_token_limit_telemetry_if_needed(cx);
+            }
+        }
+        if let Some(native_usage) = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).latest_request_token_usage())
+        {
+            if let Some(writes) = &mut self.turn_fields.turn_cache_writes {
+                *writes = native_usage.cache_creation_input_tokens;
             }
         }
     }
@@ -5387,6 +5401,16 @@ impl ThreadView {
         let input_max_label = crate::humanize_token_count(max_input_tokens);
         let output_max_label = crate::humanize_token_count(max_output_tokens);
 
+        // Cache hit + write tokens from the last request: together they show how much
+        // of the context was covered by caching (reads = served from cache, writes = newly cached).
+        let cached_tokens_label = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).latest_request_token_usage())
+            .and_then(|raw| {
+                let total = raw.cache_read_input_tokens + raw.cache_creation_input_tokens;
+                (total > 0).then(|| crate::humanize_token_count(total))
+            });
+
         let build_tooltip = {
             move |_window: &mut Window, cx: &mut App| {
                 let percentage = percentage.clone();
@@ -5399,6 +5423,7 @@ impl ThreadView {
                 let project_entry_ids = project_entry_ids.clone();
                 let workspace = workspace.clone();
                 let cost_label = cost_label.clone();
+                let cached_tokens_label = cached_tokens_label.clone();
                 cx.new(move |_cx| TokenUsageTooltip {
                     percentage,
                     used,
@@ -5407,6 +5432,7 @@ impl ThreadView {
                     output_tokens: output_tokens_label,
                     input_max: input_max_label,
                     output_max: output_max_label,
+                    cached_tokens: cached_tokens_label,
                     show_split,
                     cost_label,
                     separator_color: tooltip_separator_color,
@@ -6352,6 +6378,9 @@ struct TokenUsageTooltip {
     output_tokens: String,
     input_max: String,
     output_max: String,
+    /// Total tokens served from cache on the last request (reads + writes),
+    /// shown as an indicator of how effectively the context is cached.
+    cached_tokens: Option<String>,
     show_split: bool,
     cost_label: Option<String>,
     separator_color: Color,
@@ -6373,6 +6402,7 @@ impl Render for TokenUsageTooltip {
         let output_max = self.output_max.clone();
         let show_split = self.show_split;
         let cost_label = self.cost_label.clone();
+        let cached_tokens = self.cached_tokens.clone();
         let global_agents_md_loaded = self.global_agents_md_loaded;
         let project_rules_count = self.project_rules_count;
         let project_entry_ids = self.project_entry_ids.clone();
@@ -6416,8 +6446,26 @@ impl Render for TokenUsageTooltip {
                                     .child(Label::new(output_tokens))
                                     .child(Label::new("/").color(separator_color))
                                     .child(Label::new(output_max).color(Color::Muted)),
-                            ),
+                            )
+                            .when_some(cached_tokens.clone(), |this, cached| {
+                                this.child(
+                                    h_flex()
+                                        .gap_0p5()
+                                        .child(Label::new("Cached:").color(Color::Muted).mr_0p5())
+                                        .child(Label::new(cached)),
+                                )
+                            }),
                     )
+                })
+                .when(!show_split, |this| {
+                    this.when_some(cached_tokens, |this, cached| {
+                        this.child(
+                            h_flex()
+                                .gap_0p5()
+                                .child(Label::new("Cached:").color(Color::Muted).mr_0p5())
+                                .child(Label::new(cached)),
+                        )
+                    })
                 })
                 .when_some(cost_label, |this, cost_label| {
                     this.child(
@@ -7485,14 +7533,26 @@ impl ThreadView {
             })
             .flatten();
 
-        let last_turn_tokens_label = last_turn_clock
-            .is_some()
+        let last_turn_tokens_label = show_stats
             .then(|| {
                 self.turn_fields
                     .last_turn_tokens
                     .filter(|&tokens| tokens > TOKEN_THRESHOLD)
                     .map(|tokens| {
                         Label::new(format!("{} tokens", crate::humanize_token_count(tokens)))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                    })
+            })
+            .flatten();
+
+        let last_turn_cache_writes_label = show_stats
+            .then(|| {
+                self.turn_fields
+                    .last_turn_cache_writes
+                    .filter(|&tokens| tokens > TOKEN_THRESHOLD)
+                    .map(|tokens| {
+                        Label::new(format!("{} cached", crate::humanize_token_count(tokens)))
                             .size(LabelSize::Small)
                             .color(Color::Muted)
                     })
@@ -7572,7 +7632,9 @@ impl ThreadView {
             .opacity(0.4)
             .hover(|s| s.opacity(1.))
             .when(
-                last_turn_tokens_label.is_some() || last_turn_clock.is_some(),
+                last_turn_tokens_label.is_some()
+                    || last_turn_cache_writes_label.is_some()
+                    || last_turn_clock.is_some(),
                 |this| {
                     this.child(
                         h_flex()
@@ -7580,6 +7642,14 @@ impl ThreadView {
                             .gap_1()
                             .when_some(last_turn_tokens_label, |this, label| {
                                 this.child(label).child(separator_dots())
+                            })
+                            .when_some(last_turn_cache_writes_label, |this, label| {
+                                this.child(label).child(
+                                    Label::new("•")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .alpha(0.5),
+                                )
                             })
                             .when_some(last_turn_clock, |this, label| {
                                 this.child(label).child(separator_dots())
@@ -7992,6 +8062,16 @@ impl ThreadView {
             })
             .flatten();
 
+        let turn_cache_writes_label = elapsed_label
+            .is_some()
+            .then(|| {
+                self.turn_fields
+                    .turn_cache_writes
+                    .filter(|&tokens| tokens > TOKEN_THRESHOLD)
+                    .map(|tokens| crate::humanize_token_count(tokens))
+            })
+            .flatten();
+
         let arrow_icon = if is_waiting {
             IconName::ArrowUp
         } else {
@@ -8048,6 +8128,22 @@ impl ThreadView {
                         )
                         .child(
                             Label::new(format!("{} tokens", tokens))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .when_some(turn_cache_writes_label, |this, tokens| {
+                this.child(
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            Icon::new(IconName::DatabaseZap)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("{} cached", tokens))
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
                         ),
