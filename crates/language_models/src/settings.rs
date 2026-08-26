@@ -6,7 +6,7 @@ use settings::RegisterSetting;
 use crate::provider::{
     anthropic, anthropic::AnthropicSettings, anthropic_compatible::AnthropicCompatibleSettings,
     bedrock, bedrock::AmazonBedrockSettings, cloud::ZedDotDevSettings, deepseek::DeepSeekSettings,
-    google::GoogleSettings, llama_cpp::LlamaCppSettings, lmstudio::LmStudioSettings, mistral,
+    google::GoogleSettings, litellm::LiteLlmSettings, llama_cpp::LlamaCppSettings, lmstudio::LmStudioSettings, mistral,
     mistral::MistralSettings, ollama::OllamaSettings, open_ai::OpenAiSettings,
     open_ai_compatible::OpenAiCompatibleSettings, open_router, open_router::OpenRouterSettings,
     opencode, opencode::OpenCodeSettings, resolve_custom_headers,
@@ -20,6 +20,7 @@ pub struct AllLanguageModelSettings {
     pub bedrock: AmazonBedrockSettings,
     pub deepseek: DeepSeekSettings,
     pub google: GoogleSettings,
+    pub litellm: LiteLlmSettings,
     pub llama_cpp: LlamaCppSettings,
     pub lmstudio: LmStudioSettings,
     pub mistral: MistralSettings,
@@ -54,6 +55,7 @@ impl settings::Settings for AllLanguageModelSettings {
         let bedrock = language_models.bedrock.unwrap();
         let deepseek = language_models.deepseek.unwrap();
         let google = language_models.google.unwrap();
+        let litellm = language_models.litellm.unwrap();
         let llama_cpp = language_models.llama_cpp.unwrap();
         let lmstudio = language_models.lmstudio.unwrap();
         let mistral = language_models.mistral.unwrap();
@@ -126,6 +128,9 @@ impl settings::Settings for AllLanguageModelSettings {
                 available_models: llama_cpp.available_models.unwrap_or_default(),
                 context_window: llama_cpp.context_window,
                 custom_headers: custom_headers_from("llama.cpp", llama_cpp.custom_headers, &[]),
+            },
+            litellm: LiteLlmSettings {
+                api_url: litellm.api_url.unwrap(),
             },
             lmstudio: LmStudioSettings {
                 api_url: lmstudio.api_url.unwrap(),

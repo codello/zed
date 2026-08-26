@@ -19,6 +19,7 @@ pub enum IconName {
     AiGoogle,
     AiLlamaCpp,
     AiLmStudio,
+    AiMaibornWolff,
     AiMistral,
     AiOllama,
     AiOpenAi,
