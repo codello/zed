@@ -6354,10 +6354,6 @@ impl RepositorySnapshot {
         );
 
         let repository_anchor = self.linked_worktree_anchor_path();
-        let project_name = self
-            .path_style
-            .file_name(repository_anchor)
-            .ok_or_else(|| anyhow!("git repo must have a directory name"))?;
         let directory = worktrees_directory_for_repo(
             repository_anchor,
             worktree_directory_setting,
@@ -6373,7 +6369,7 @@ impl RepositorySnapshot {
              which is outside the configured worktree directory {directory:?}"
         );
 
-        Ok(self.path_style.join(&worktree_directory, project_name))
+        Ok(worktree_directory)
     }
 
     /// Returns true if this repository is a linked worktree, that is, one that
@@ -13048,12 +13044,11 @@ mod tests {
         let work_dir = Path::new("/home/user/dev/lsp-tests");
         let directory =
             worktrees_directory_for_repo(work_dir, "../worktrees", PathStyle::Unix).unwrap();
-        let directory = PathStyle::Unix.join(&directory, "nimble-sky");
-        let path = PathStyle::Unix.join(&directory, "lsp-tests");
+        let path = PathStyle::Unix.join(&directory, "nimble-sky");
 
         assert_eq!(
             path,
-            PathBuf::from("/home/user/dev/worktrees/lsp-tests/nimble-sky/lsp-tests")
+            PathBuf::from("/home/user/dev/worktrees/lsp-tests/nimble-sky")
         );
     }
 
@@ -13072,7 +13067,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             path,
-            PathBuf::from(r"C:\Users\user\dev\worktrees\lsp-tests\nimble-sky\lsp-tests")
+            PathBuf::from(r"C:\Users\user\dev\worktrees\lsp-tests\nimble-sky")
         );
     }
 
@@ -13100,7 +13095,7 @@ mod tests {
             snapshot
                 .path_for_new_linked_worktree("nimble-sky", "../worktrees")
                 .unwrap(),
-            PathBuf::from(r"C:\Users\user\dev\worktrees\lsp-tests\nimble-sky\lsp-tests")
+            PathBuf::from(r"C:\Users\user\dev\worktrees\lsp-tests\nimble-sky")
         );
     }
 
@@ -13145,7 +13140,7 @@ mod tests {
             unix_snapshot
                 .path_for_new_linked_worktree("feature/nested", "../worktrees")
                 .unwrap(),
-            PathBuf::from("/home/user/dev/worktrees/lsp-tests/feature/nested/lsp-tests")
+            PathBuf::from("/home/user/dev/worktrees/lsp-tests/feature/nested")
         );
     }
 
