@@ -1,6 +1,6 @@
 use brush_parser::ast;
 use brush_parser::ast::SourceLocation;
-use brush_parser::word::WordPiece;
+use brush_parser::word::{Parameter, ParameterExpr, WordPiece};
 use brush_parser::{Parser, ParserOptions, SourceInfo};
 use std::io::BufReader;
 
@@ -339,9 +339,8 @@ fn word_piece_validation(piece: &WordPiece) -> TerminalProgramValidation {
                 .iter()
                 .map(|inner| word_piece_validation(&inner.piece)),
         ),
-        WordPiece::ParameterExpansion(_) | WordPiece::ArithmeticExpression(_) => {
-            TerminalProgramValidation::Unsafe
-        }
+        WordPiece::ParameterExpansion(expr) => parameter_expansion_validation(expr),
+        WordPiece::ArithmeticExpression(_) => TerminalProgramValidation::Unsafe,
         WordPiece::CommandSubstitution(command)
         | WordPiece::BackquotedCommandSubstitution(command) => {
             let reader = BufReader::new(command.as_bytes());
@@ -355,6 +354,18 @@ fn word_piece_validation(piece: &WordPiece) -> TerminalProgramValidation {
             }
         }
     }
+}
+
+fn parameter_expansion_validation(expr: &ParameterExpr) -> TerminalProgramValidation {
+    if let ParameterExpr::Parameter {
+        parameter: Parameter::Named(name),
+        indirect: false,
+    } = expr
+        && name == "TMPDIR"
+    {
+        return TerminalProgramValidation::Safe;
+    }
+    TerminalProgramValidation::Unsafe
 }
 
 fn compound_command_validation(
@@ -1751,6 +1762,26 @@ mod tests {
         );
         assert_eq!(
             validate_terminal_command("echo $@"),
+            TerminalCommandValidation::Unsafe
+        );
+    }
+
+    #[test]
+    fn test_validate_terminal_command_allows_tmpdir_parameter_expansion() {
+        assert_eq!(
+            validate_terminal_command("echo $TMPDIR"),
+            TerminalCommandValidation::Safe
+        );
+        assert_eq!(
+            validate_terminal_command("echo ${TMPDIR}"),
+            TerminalCommandValidation::Safe
+        );
+        assert_eq!(
+            validate_terminal_command("echo $TMPDIRX"),
+            TerminalCommandValidation::Unsafe
+        );
+        assert_eq!(
+            validate_terminal_command("echo ${TMPDIR:-$(whoami)}"),
             TerminalCommandValidation::Unsafe
         );
     }
