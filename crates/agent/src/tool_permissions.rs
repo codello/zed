@@ -1128,6 +1128,14 @@ mod tests {
     }
 
     #[test]
+    fn tmpdir_substitution_is_not_denied_for_invalid_command() {
+        let decision = no_rules("echo $TMPDIR", ToolPermissionMode::Confirm);
+        assert!(matches!(decision, ToolPermissionDecision::Confirm));
+        let decision = no_rules("echo ${TMPDIR}", ToolPermissionMode::Confirm);
+        assert!(matches!(decision, ToolPermissionDecision::Confirm));
+    }
+
+    #[test]
     fn unconditional_allow_all_bypasses_invalid_command_rejection_without_tool_rules() {
         let decision = no_rules("echo $HOME", ToolPermissionMode::Allow);
         assert_eq!(decision, ToolPermissionDecision::Allow);
