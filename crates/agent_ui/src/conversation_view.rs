@@ -1,9 +1,9 @@
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
-    AuthRequired, ClientUserMessageId, ElicitationEntryId, ElicitationStatus, ElicitationStore,
-    LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice, PermissionOptions,
-    PermissionPattern, RetryStatus, SelectedPermissionOutcome, ThreadStatus, ToolCall,
-    ToolCallContent, ToolCallStatus,
+    AuthRequired, ClientUserMessageId, Elicitation, ElicitationEntryId, ElicitationStatus,
+    ElicitationStore, LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice,
+    PermissionOptions, PermissionPattern, RetryStatus, SelectedPermissionOutcome, ThreadStatus,
+    ToolCall, ToolCallContent, ToolCallStatus,
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
@@ -424,6 +424,29 @@ impl Conversation {
             .unwrap_or(0)
     }
 
+    pub fn pending_elicitation<'a>(
+        &'a self,
+        session_id: &acp::SessionId,
+        cx: &'a App,
+    ) -> Option<(acp::SessionId, ElicitationEntryId, &'a Elicitation)> {
+        let thread = self.threads.get(session_id)?;
+        let is_subagent = thread.read(cx).parent_session_id().is_some();
+        let (result_session_id, thread, elicitation_id) = if is_subagent {
+            let id = self.elicitation_requests.get(session_id)?.iter().next()?;
+            (session_id.clone(), thread, id)
+        } else {
+            let (session_id, elicitation_ids) = self.elicitation_requests.first()?;
+            let thread = self.threads.get(session_id)?;
+            let id = elicitation_ids.iter().next()?;
+            (session_id.clone(), thread, id)
+        };
+        let (_, elicitation) = thread.read(cx).elicitation(elicitation_id)?;
+        if !matches!(elicitation.status, ElicitationStatus::Pending { .. }) {
+            return None;
+        }
+        Some((result_session_id, elicitation_id.clone(), elicitation))
+    }
+
     pub fn respond_to_elicitation(
         &mut self,
         session_id: acp::SessionId,
@@ -657,6 +680,20 @@ impl ConversationView {
             .conversation
             .read(cx)
             .pending_tool_call(&session_id, cx)
+    }
+
+    pub fn root_thread_has_pending_elicitation(&self, cx: &App) -> bool {
+        let Some(root_thread) = self.root_thread_view() else {
+            return false;
+        };
+        let root_session_id = root_thread.read(cx).thread.read(cx).session_id().clone();
+        self.as_connected().is_some_and(|connected| {
+            connected
+                .conversation
+                .read(cx)
+                .pending_elicitation(&root_session_id, cx)
+                .is_some()
+        })
     }
 
     pub fn root_thread_has_pending_tool_call(&self, cx: &App) -> bool {
@@ -10192,6 +10229,79 @@ pub(crate) mod tests {
                 .expect("Expected a pending tool call from parent query");
             assert_eq!(returned_session_id, parent_session_id);
             assert_eq!(tool_call_id, acp::ToolCallId::new("parent-tc"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_conversation_subagent_pending_elicitation(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+
+        let (_parent_thread, subagent_thread, conversation) = cx.update(|cx| {
+            let parent_thread =
+                create_test_acp_thread(None, "parent", connection.clone(), project.clone(), cx);
+            let subagent_thread = create_test_acp_thread(
+                Some(acp::SessionId::new("parent")),
+                "subagent",
+                connection.clone(),
+                project.clone(),
+                cx,
+            );
+            let conversation = cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(parent_thread.clone(), cx);
+                conversation.register_thread(subagent_thread.clone(), cx);
+                conversation
+            });
+            (parent_thread, subagent_thread, conversation)
+        });
+
+        let parent_session_id = acp::SessionId::new("parent");
+        let subagent_session_id =
+            subagent_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let (elicitation_id, _task) = subagent_thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation_with_id(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(subagent_session_id.clone()),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Which approach?",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        cx.run_until_parked();
+
+        // Querying with the subagent's session ID returns the subagent's own
+        // pending elicitation
+        cx.read(|cx| {
+            let (returned_session_id, _, elicitation) = conversation
+                .read(cx)
+                .pending_elicitation(&subagent_session_id, cx)
+                .expect("Expected subagent's pending elicitation");
+            assert_eq!(returned_session_id, subagent_session_id);
+            assert!(matches!(
+                elicitation.status,
+                acp_thread::ElicitationStatus::Pending { .. }
+            ));
+        });
+
+        // Querying with the root session ID also returns the subagent's
+        // elicitation via FIFO across all sessions
+        cx.read(|cx| {
+            let (returned_session_id, _, elicitation) = conversation
+                .read(cx)
+                .pending_elicitation(&parent_session_id, cx)
+                .expect("Expected subagent's elicitation from root session query");
+            assert_eq!(returned_session_id, subagent_session_id);
+            assert_eq!(elicitation.request.message, "Which approach?");
         });
     }
 

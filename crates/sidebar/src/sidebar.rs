@@ -8026,6 +8026,9 @@ fn all_thread_infos_for_workspace(
             let has_pending_tool_call = conversation_view
                 .read(cx)
                 .root_thread_has_pending_tool_call(cx);
+            let has_pending_elicitation = conversation_view
+                .read(cx)
+                .root_thread_has_pending_elicitation(cx);
             let conversation_thread_id = conversation_view.read(cx).parent_id();
             let thread_view = conversation_view.read(cx).root_thread_view()?;
             let thread_view_ref = thread_view.read(cx);
@@ -8042,7 +8045,7 @@ fn all_thread_infos_for_workspace(
             let session_id = thread.session_id().clone();
             let is_background = agent_panel.is_retained_thread(&conversation_thread_id);
 
-            let status = if has_pending_tool_call {
+            let status = if has_pending_tool_call || has_pending_elicitation {
                 AgentThreadStatus::WaitingForConfirmation
             } else if thread.had_error() {
                 AgentThreadStatus::Error
@@ -8265,9 +8268,9 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
             if panel
                 .active_conversation_view()
                 .is_some_and(|conversation_view| {
-                    conversation_view
-                        .read(cx)
-                        .root_thread_has_pending_tool_call(cx)
+                    let conversation_view = conversation_view.read(cx);
+                    conversation_view.root_thread_has_pending_tool_call(cx)
+                        || conversation_view.root_thread_has_pending_elicitation(cx)
                 })
             {
                 write!(output, ", awaiting confirmation").ok();
@@ -8299,6 +8302,9 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
                     if conversation_view
                         .read(cx)
                         .root_thread_has_pending_tool_call(cx)
+                        || conversation_view
+                            .read(cx)
+                            .root_thread_has_pending_elicitation(cx)
                     {
                         write!(output, ", awaiting confirmation").ok();
                     }
