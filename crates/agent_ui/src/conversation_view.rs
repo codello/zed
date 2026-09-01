@@ -665,11 +665,14 @@ impl ConversationView {
         };
         let root_session_id = root_thread.read(cx).thread.read(cx).session_id().clone();
         self.as_connected().is_some_and(|connected| {
-            connected
-                .conversation
-                .read(cx)
+            let conversation = connected.conversation.read(cx);
+            conversation
                 .pending_tool_call(&root_session_id, cx)
                 .is_some()
+                || conversation
+                    .elicitation_requests
+                    .get(&root_session_id)
+                    .is_some_and(|elicitations| !elicitations.is_empty())
         })
     }
 
