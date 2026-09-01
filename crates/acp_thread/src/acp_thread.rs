@@ -7038,6 +7038,13 @@ impl AcpThread {
         Some((index, elicitation))
     }
 
+    pub fn pending_elicitations(&self) -> impl Iterator<Item = &Elicitation> {
+        self.elicitations
+            .elicitations()
+            .iter()
+            .filter(|elicitation| matches!(elicitation.status, ElicitationStatus::Pending { .. }))
+    }
+
     pub fn plan(&self) -> Option<&Plan> {
         self.plans.get(self.visible_plan.as_ref()?)
     }
