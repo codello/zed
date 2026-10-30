@@ -987,6 +987,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: Some(1024),
         };
@@ -1162,6 +1163,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: Some(8192),
         };
@@ -1229,6 +1231,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: Some("xhigh".into()),
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -1565,6 +1568,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -1630,6 +1634,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -1677,6 +1682,7 @@ mod tests {
             tool_choice: None,
             thinking_allowed: true,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };

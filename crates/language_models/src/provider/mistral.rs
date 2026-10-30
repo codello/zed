@@ -875,6 +875,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             speed: Default::default(),
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens,
         };
@@ -924,6 +925,7 @@ mod tests {
             thinking_allowed,
             thinking_effort: None,
             speed: Default::default(),
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -1001,6 +1003,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
