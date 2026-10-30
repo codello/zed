@@ -81,6 +81,7 @@ use super::config_options::ConfigOptionsView;
 use super::entry_view_state::EntryViewState;
 use crate::ModeSelector;
 use crate::ModelSelectorPopover;
+use crate::UpstreamProviderSelector;
 use crate::agent_connection_store::{
     AgentConnectedState, AgentConnectionEntryEvent, AgentConnectionStore,
 };
@@ -1643,6 +1644,7 @@ impl ConversationView {
         let config_options_view;
         let mode_selector;
         let model_selector;
+        let upstream_provider_selector;
         if let Some(config_options) = config_options_provider {
             // Use config options - don't create mode_selector or model_selector
             let agent_server = self.agent.clone();
@@ -1653,10 +1655,22 @@ impl ConversationView {
                 }));
             model_selector = None;
             mode_selector = None;
+            upstream_provider_selector = None;
         } else {
             // Fall back to dedicated mode/model selectors
             config_options_view = None;
-            model_selector = connection.model_selector(&session_id).map(|selector| {
+            let model_selector_connection = connection.model_selector(&session_id);
+            upstream_provider_selector = model_selector_connection.clone().map(|selector| {
+                cx.new(|cx| {
+                    UpstreamProviderSelector::new(
+                        selector,
+                        PopoverMenuHandle::default(),
+                        window,
+                        cx,
+                    )
+                })
+            });
+            model_selector = model_selector_connection.map(|selector| {
                 cx.new(|cx| {
                     ModelSelectorPopover::new(
                         selector,
@@ -1747,6 +1761,7 @@ impl ConversationView {
                 config_options_view,
                 mode_selector,
                 model_selector,
+                upstream_provider_selector,
                 profile_selector,
                 list_state,
                 session_capabilities,

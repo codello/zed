@@ -25,8 +25,14 @@ open_ai.workspace = true
 schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+serde_json_lenient.workspace = true
 settings.workspace = true
 thiserror.workspace = true
+time.workspace = true
+url.workspace = true
 
 [dev-dependencies]
+clap.workspace = true
 http_client = { workspace = true, features = ["test-support"] }
+reqwest_client.workspace = true
+rpassword = "7.4"

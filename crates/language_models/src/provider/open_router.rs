@@ -6,21 +6,27 @@ use gpui::{App, AppContext, AsyncApp, Context, Entity, SharedString, Task};
 use http_client::{CustomHeaders, HttpClient};
 use language_model::chat_completion::ChatCompletionEventMapper;
 use language_model::{
-    ApiKeyConfiguration, ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel,
-    LanguageModelClient, LanguageModelCompletionError, LanguageModelCompletionStream,
-    LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
-    LanguageModelRequest, LanguageModelToolChoice, LanguageModelToolChoiceSupport,
-    LanguageModelToolResultContent, MessageContent, ModelRateLimiters, ProviderSettingsView, Role,
+    ApiKeyConfiguration, ApiKeyState, AuthenticateError, DEFAULT_OUTPUT_INPUT_RATIO, EnvVar,
+    IconOrSvg, LanguageModel, LanguageModelClient, LanguageModelCompletionError,
+    LanguageModelCompletionStream, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
+    LanguageModelToolChoiceSupport, LanguageModelToolResultContent, MessageContent,
+    ModelRateLimiters, ProviderSettingsView, Role, UpstreamProvider, UpstreamProviderPricing,
     env_var, unavailable_error,
 };
 use open_router::{
-    Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ReasoningEffort,
-    ResponseStreamEvent, list_models,
+    FrontendEndpoint, Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL,
+    ProviderEndpoint, ReasoningEffort, ResponseStreamEvent, list_frontend_endpoints, list_models,
+    list_provider_endpoints, personal_cache_stats,
 };
+use scheduler::Instant;
 use settings::{OpenRouterAvailableModel as AvailableModel, Settings, SettingsStore};
 use sha2::{Digest as _, Sha256};
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use ui::IconName;
 use util::ResultExt;
 
@@ -28,6 +34,8 @@ const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("openr
 const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("OpenRouter");
 
 const API_KEY_ENV_VAR_NAME: &str = "OPENROUTER_API_KEY";
+const PROVIDER_ENDPOINTS_TTL: Duration = Duration::from_secs(60 * 60);
+
 static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
 pub(crate) const RESERVED_HEADER_NAMES: &[&str] = &["HTTP-Referer", "X-Title"];
 
@@ -49,8 +57,14 @@ pub struct State {
     credentials_provider: Arc<dyn CredentialsProvider>,
     http_client: Arc<dyn HttpClient>,
     available_models: Vec<open_router::Model>,
+    upstream_providers: HashMap<String, CachedUpstreamProviders>,
     fetch_models_task: Option<Task<()>>,
     last_fetch_models_error: Option<String>,
+}
+
+struct CachedUpstreamProviders {
+    providers: Vec<UpstreamProvider>,
+    fetched_at: Instant,
 }
 
 impl State {
@@ -125,6 +139,7 @@ impl State {
     }
 
     fn restart_fetch_models_task(&mut self, cx: &mut Context<Self>) {
+        self.upstream_providers.clear();
         if self.is_authenticated() {
             let fetch_task = self.fetch_models(cx);
             let task = cx.spawn(async move |this, cx| {
@@ -169,6 +184,7 @@ impl OpenRouterLanguageModelProvider {
                 credentials_provider,
                 http_client: http_client.clone(),
                 available_models: Vec::new(),
+                upstream_providers: HashMap::default(),
                 fetch_models_task: None,
                 last_fetch_models_error: None,
             }
@@ -214,6 +230,7 @@ impl OpenRouterLanguageModelProvider {
             settings_models.push(open_router::Model {
                 name: model.name.clone(),
                 display_name: model.display_name.clone(),
+                canonical_slug: None,
                 max_tokens: model.max_tokens,
                 supports_tools: model.supports_tools,
                 supports_images: model.supports_images,
@@ -342,6 +359,140 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
             .collect()
     }
 
+    fn upstream_providers(
+        &self,
+        model: &LanguageModel,
+        cx: &mut App,
+    ) -> Task<Result<Option<Vec<UpstreamProvider>>>> {
+        let configured = Self::settings(cx)
+            .available_models
+            .iter()
+            .any(|configured| configured.name == model.id().0.as_ref());
+        if configured {
+            return Task::ready(Ok(None));
+        }
+
+        let model_id = model.id().0.to_string();
+        let now = cx.background_executor().now();
+        let fresh = self
+            .state
+            .read(cx)
+            .upstream_providers
+            .get(&model_id)
+            .filter(|cached| now.duration_since(cached.fetched_at) < PROVIDER_ENDPOINTS_TTL)
+            .map(|cached| cached.providers.clone());
+        if let Some(providers) = fresh {
+            return Task::ready(Ok(Some(providers)));
+        }
+
+        let http_client = self.http_client.clone();
+        let api_url = Self::api_url(cx);
+        let extra_headers = Self::settings(cx).custom_headers.clone();
+        let Some(api_key) = self.state.read(cx).api_key_state.key(&api_url) else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "No API key is configured for {}",
+                PROVIDER_NAME.0
+            )));
+        };
+
+        let canonical_slug = self
+            .state
+            .read(cx)
+            .available_models
+            .iter()
+            .find(|model| model.name == model_id)
+            .and_then(|model| model.canonical_slug.clone())
+            .unwrap_or_else(|| model_id.clone());
+        let state = self.state.clone();
+        cx.spawn(async move |cx| {
+            // Both APIs are queried in parallel. The website API is
+            // best-effort enrichment: without it the list still carries the
+            // list prices.
+            let (endpoints_result, frontend_result) = futures::future::join(
+                list_provider_endpoints(
+                    http_client.as_ref(),
+                    &api_url,
+                    &api_key,
+                    &model_id,
+                    &extra_headers,
+                ),
+                list_frontend_endpoints(http_client.as_ref(), &canonical_slug),
+            )
+            .await;
+
+            let frontend_endpoints = match frontend_result {
+                Ok(endpoints) => endpoints,
+                Err(error) => {
+                    log::warn!("Failed to fetch OpenRouter endpoint stats: {error:?}");
+                    HashMap::new()
+                }
+            };
+
+            let endpoints = match endpoints_result {
+                Ok(endpoints) => endpoints,
+                Err(error) => {
+                    let error = LanguageModelCompletionError::from(error);
+                    let stale = state.read_with(cx, |state, _cx| {
+                        state
+                            .upstream_providers
+                            .get(&model_id)
+                            .map(|cached| cached.providers.clone())
+                    });
+                    let Some(providers) = stale else {
+                        return Err(error.into());
+                    };
+                    log::warn!(
+                        "Failed to refresh upstream providers for {model_id}, using the cached list: {error:#}"
+                    );
+                    return Ok(Some(providers));
+                }
+            };
+
+            let providers = upstream_providers_from_endpoints(
+                &endpoints,
+                &frontend_endpoints,
+                &canonical_slug,
+            );
+            let fetched_at = cx.background_executor().now();
+            state.update(cx, |state, cx| {
+                state.upstream_providers.insert(
+                    model_id,
+                    CachedUpstreamProviders {
+                        providers: providers.clone(),
+                        fetched_at,
+                    },
+                );
+                cx.notify();
+            });
+            Ok(Some(providers))
+        })
+    }
+
+    fn upstream_provider(
+        &self,
+        model: &LanguageModel,
+        provider: &str,
+        cx: &App,
+    ) -> Option<UpstreamProvider> {
+        if Self::settings(cx)
+            .available_models
+            .iter()
+            .any(|configured| configured.name == model.id().0.as_ref())
+        {
+            return None;
+        }
+        let cached = self
+            .state
+            .read(cx)
+            .upstream_providers
+            .get(model.id().0.as_ref())?;
+        cached
+            .providers
+            .iter()
+            .find(|listed| listed.id == provider)
+            .cloned()
+    }
+
     fn is_authenticated(&self, cx: &App) -> bool {
         self.state.read(cx).is_authenticated()
     }
@@ -369,6 +520,90 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
         self.state
             .update(cx, |state, cx| state.set_api_key(api_key, cx))
     }
+}
+
+fn upstream_providers_from_endpoints(
+    endpoints: &[ProviderEndpoint],
+    frontend_endpoints: &HashMap<String, FrontendEndpoint>,
+    canonical_slug: &str,
+) -> Vec<UpstreamProvider> {
+    let mut providers: Vec<UpstreamProvider> = endpoints
+        .iter()
+        .map(|endpoint| {
+            let id = endpoint.slug.clone();
+            let frontend_endpoint = frontend_endpoints.get(id.as_str());
+            // The website API derives the service tier; the versioned API
+            // reports it only for some endpoints.
+            let service_tier = frontend_endpoint
+                .and_then(|endpoint| endpoint.service_tier.clone())
+                .or_else(|| endpoint.service_tier.clone());
+            let quantization = endpoint
+                .quantization
+                .clone()
+                .filter(|quantization| *quantization != "unknown");
+            let region = frontend_endpoint.and_then(|endpoint| endpoint.region.clone());
+            let headquarters = frontend_endpoint.and_then(|endpoint| endpoint.headquarters.clone());
+            let datacenters = frontend_endpoint
+                .map(|endpoint| endpoint.datacenters.clone())
+                .unwrap_or_default();
+            let icon_url = frontend_endpoint.and_then(|endpoint| endpoint.icon_url.clone());
+            let cache_read = endpoint
+                .pricing
+                .input_cache_read
+                .map(|price| price * 1_000_000.0);
+            let cache_write = endpoint
+                .pricing
+                .input_cache_write
+                .map(|price| price * 1_000_000.0);
+            // An endpoint that cannot cache has a rate of exactly zero; for
+            // an endpoint with unknown data the rate is missing and the
+            // list input price stands in.
+            let cache_hit_rate = if cache_read.is_some() {
+                frontend_endpoint.and_then(|endpoint| {
+                    personal_cache_stats().calibrated_cache_hit_rate(
+                        canonical_slug,
+                        endpoint,
+                        frontend_endpoints,
+                    )
+                })
+            } else {
+                Some(0.0)
+            };
+            UpstreamProvider {
+                id,
+                name: endpoint.provider_name.clone(),
+                service_tier,
+                quantization,
+                region,
+                headquarters,
+                datacenters,
+                icon_url,
+                pricing: UpstreamProviderPricing {
+                    input: endpoint.pricing.prompt * 1_000_000.0,
+                    output: endpoint.pricing.completion * 1_000_000.0,
+                    cache_read,
+                    cache_write,
+                    discount: endpoint.pricing.discount,
+                    cache_hit_rate,
+                    output_input_ratio: personal_cache_stats()
+                        .output_input_ratio(canonical_slug)
+                        .unwrap_or(DEFAULT_OUTPUT_INPUT_RATIO),
+                },
+                throughput: endpoint.throughput_last_30m.as_ref().map(|stats| stats.p50),
+                latency: endpoint.latency_last_30m.as_ref().map(|stats| stats.p50),
+                context_length: endpoint.context_length,
+            }
+        })
+        .collect();
+
+    // Fastest first. Endpoints without throughput data go last.
+    providers.sort_by(|left, right| {
+        right
+            .throughput
+            .partial_cmp(&left.throughput)
+            .unwrap_or(Ordering::Equal)
+    });
+    providers
 }
 
 impl LanguageModelClient for OpenRouterLanguageModelProvider {
@@ -432,7 +667,6 @@ fn language_model(model: &open_router::Model) -> LanguageModel {
         ),
         supports_disabling_thinking: !model.mandatory_reasoning,
         supported_effort_levels,
-        max_output_tokens: model.max_output_tokens(),
         tool_choice_support: LanguageModelToolChoiceSupport::ALL,
         supports_images: model.supports_images.unwrap_or(false),
         ..LanguageModel::new(
@@ -664,7 +898,14 @@ pub fn into_open_router(
             LanguageModelToolChoice::Any => open_router::ToolChoice::Required,
             LanguageModelToolChoice::None => open_router::ToolChoice::None,
         }),
-        provider: model.provider.clone(),
+        provider: request
+            .upstream_provider
+            .map(|upstream_provider| {
+                let mut provider = model.provider.clone().unwrap_or_default();
+                provider.only = Some(vec![upstream_provider]);
+                provider
+            })
+            .or_else(|| model.provider.clone()),
     })
 }
 
@@ -768,6 +1009,8 @@ fn add_message_content_part(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::BorrowAppContext;
+    use open_router::{PercentileStats, ProviderPricing};
 
     #[gpui::test]
     async fn test_session_id_is_stable_without_exposing_thread_id() {
@@ -868,6 +1111,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -1012,6 +1256,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -1080,6 +1325,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -1190,6 +1436,91 @@ mod tests {
         assert_eq!(reasoning.max_tokens, None);
     }
 
+    #[test]
+    fn into_open_router_uses_requested_upstream_provider() {
+        let model = open_router::Model::new(
+            "openai/gpt-4",
+            Some("GPT-4"),
+            Some(8192),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        let request = LanguageModelRequest {
+            upstream_provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+
+        let result = into_open_router(request, &model, None).unwrap();
+        let provider = result.provider.expect("provider should be set");
+        assert_eq!(provider.only, Some(vec!["openai".to_string()]));
+    }
+
+    #[test]
+    fn into_open_router_falls_back_to_model_provider() {
+        let model = open_router::Model::new(
+            "openai/gpt-4",
+            Some("GPT-4"),
+            Some(8192),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            None,
+            false,
+            Some(provider_with_only("azure")),
+        );
+
+        let result = into_open_router(LanguageModelRequest::default(), &model, None).unwrap();
+        let provider = result.provider.expect("provider from model");
+        assert_eq!(provider.only, Some(vec!["azure".to_string()]));
+    }
+
+    #[test]
+    fn into_open_router_merges_upstream_provider_into_model_provider() {
+        let model_provider: open_router::Provider = serde_json::from_value(serde_json::json!({
+            "only": ["anthropic"],
+            "order": ["anthropic"],
+            "allow_fallbacks": false,
+            "sort": "price"
+        }))
+        .unwrap();
+        let model = open_router::Model::new(
+            "openai/gpt-4",
+            Some("GPT-4"),
+            Some(8192),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            None,
+            false,
+            Some(model_provider),
+        );
+        let request = LanguageModelRequest {
+            upstream_provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+
+        let result = into_open_router(request, &model, None).unwrap();
+        let provider = result.provider.expect("provider should be set");
+        let value = serde_json::to_value(&provider).unwrap();
+        assert_eq!(value["only"], serde_json::json!(["openai"]));
+        assert_eq!(value["order"], serde_json::json!(["anthropic"]));
+        assert_eq!(value["allow_fallbacks"], serde_json::json!(false));
+        assert_eq!(value["sort"], serde_json::json!("price"));
+    }
+
+    fn provider_with_only(only: &str) -> open_router::Provider {
+        let mut provider = open_router::Provider::default();
+        provider.only = Some(vec![only.to_string()]);
+        provider
+    }
+
     struct TestCredentialsProvider;
 
     impl CredentialsProvider for TestCredentialsProvider {
@@ -1248,6 +1579,656 @@ mod tests {
         assert!(
             error.is_some(),
             "a failed model fetch should be recorded, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn upstream_providers_from_endpoints_builds_tags_and_pricing() {
+        let list_pricing = ProviderPricing {
+            prompt: 0.00003,
+            completion: 0.00006,
+            input_cache_read: None,
+            input_cache_write: None,
+            discount: 0.0,
+        };
+        // Without cache-read pricing the endpoint cannot cache: the rate is
+        // zero and the list input price stands in.
+        let list_upstream_pricing = UpstreamProviderPricing {
+            input: 30.0,
+            output: 60.0,
+            cache_read: None,
+            cache_write: None,
+            discount: 0.0,
+            cache_hit_rate: Some(0.0),
+            output_input_ratio: 0.01,
+        };
+        let endpoints = vec![
+            ProviderEndpoint {
+                name: "OpenAI: GPT-4".to_string(),
+                provider_name: "OpenAI".to_string(),
+                slug: "openai".to_string(),
+                context_length: 8192,
+                max_completion_tokens: Some(4096),
+                quantization: Some("fp16".to_string()),
+                service_tier: Some("flex".to_string()),
+                status: Some(0),
+                supported_parameters: vec!["tools".to_string()],
+                pricing: ProviderPricing {
+                    prompt: 0.00003,
+                    completion: 0.00006,
+                    input_cache_read: Some(0.000015),
+                    input_cache_write: None,
+                    discount: 0.25,
+                },
+                throughput_last_30m: Some(PercentileStats {
+                    p50: 68.4,
+                    p75: 55.1,
+                    p90: 41.2,
+                    p99: 22.9,
+                }),
+                latency_last_30m: Some(PercentileStats {
+                    p50: 460.0,
+                    p75: 720.0,
+                    p90: 1100.0,
+                    p99: 2400.0,
+                }),
+            },
+            ProviderEndpoint {
+                name: "DeepInfra (Turbo): GPT-4".to_string(),
+                provider_name: "DeepInfra".to_string(),
+                slug: "deepinfra/turbo".to_string(),
+                context_length: 16384,
+                max_completion_tokens: Some(8192),
+                quantization: None,
+                service_tier: None,
+                status: Some(0),
+                supported_parameters: Vec::new(),
+                pricing: list_pricing.clone(),
+                throughput_last_30m: None,
+                latency_last_30m: None,
+            },
+            ProviderEndpoint {
+                name: "Together: GPT-4".to_string(),
+                provider_name: "Together".to_string(),
+                slug: "together".to_string(),
+                context_length: 8192,
+                max_completion_tokens: Some(4096),
+                quantization: Some("unknown".to_string()),
+                service_tier: Some("priority".to_string()),
+                status: Some(0),
+                supported_parameters: Vec::new(),
+                pricing: list_pricing.clone(),
+                throughput_last_30m: Some(PercentileStats {
+                    p50: 120.0,
+                    p75: 100.0,
+                    p90: 80.0,
+                    p99: 40.0,
+                }),
+                latency_last_30m: None,
+            },
+            ProviderEndpoint {
+                name: "GMICloud: GPT-4".to_string(),
+                provider_name: "GMICloud".to_string(),
+                slug: "gmicloud/fp8".to_string(),
+                context_length: 32768,
+                max_completion_tokens: None,
+                quantization: Some("fp8".to_string()),
+                service_tier: None,
+                status: Some(0),
+                supported_parameters: Vec::new(),
+                pricing: list_pricing.clone(),
+                throughput_last_30m: None,
+                latency_last_30m: None,
+            },
+        ];
+
+        let options = upstream_providers_from_endpoints(
+            &endpoints,
+            &HashMap::from([(
+                "openai".to_string(),
+                FrontendEndpoint {
+                    provider_name: None,
+                    cache_hit_rate: Some(0.5),
+                    region: None,
+                    service_tier: Some("priority".to_string()),
+                    headquarters: None,
+                    datacenters: Vec::new(),
+                    icon_url: None,
+                    pricing: None,
+                },
+            )]),
+            "openai/gpt-4",
+        );
+
+        assert_eq!(
+            options[0],
+            UpstreamProvider {
+                id: "together".to_string(),
+                name: "Together".to_string(),
+                service_tier: Some("priority".to_string()),
+                quantization: None,
+                region: None,
+                headquarters: None,
+                datacenters: Vec::new(),
+                icon_url: None,
+                pricing: list_upstream_pricing.clone(),
+                throughput: Some(120.0),
+                latency: None,
+                context_length: 8192,
+            }
+        );
+        assert_eq!(options[1].id, "openai");
+        // The website tier wins over the versioned API's service tier.
+        assert_eq!(options[1].service_tier.as_deref(), Some("priority"));
+        assert_eq!(options[1].quantization.as_deref(), Some("fp16"));
+        let pricing = &options[1].pricing;
+        assert_eq!(pricing.input, 30.0);
+        assert_eq!(pricing.output, 60.0);
+        assert_eq!(pricing.cache_read, Some(15.0));
+        assert_eq!(pricing.discount, 0.25);
+        // No personal measurement for this model: the global rate stands in.
+        assert_eq!(pricing.cache_hit_rate, Some(0.5));
+        // 0.5 * 15 + 0.5 * 30
+        assert!((pricing.effective_input() - 22.5).abs() < 1e-9);
+        // 22.5 + 0.01 * 60
+        assert!((pricing.blended() - 23.1).abs() < 1e-9);
+        assert_eq!(
+            options[2],
+            UpstreamProvider {
+                id: "deepinfra/turbo".to_string(),
+                name: "DeepInfra".to_string(),
+                service_tier: None,
+                quantization: None,
+                region: None,
+                headquarters: None,
+                datacenters: Vec::new(),
+                icon_url: None,
+                pricing: list_upstream_pricing.clone(),
+                throughput: None,
+                latency: None,
+                context_length: 16384,
+            }
+        );
+        assert_eq!(
+            options[3],
+            UpstreamProvider {
+                id: "gmicloud/fp8".to_string(),
+                name: "GMICloud".to_string(),
+                service_tier: None,
+                quantization: Some("fp8".to_string()),
+                region: None,
+                headquarters: None,
+                datacenters: Vec::new(),
+                icon_url: None,
+                pricing: list_upstream_pricing.clone(),
+                throughput: None,
+                latency: None,
+                context_length: 32768,
+            }
+        );
+    }
+
+    #[test]
+    fn upstream_providers_without_cache_rate_data_fall_back_to_list_prices() {
+        let endpoints = vec![
+            ProviderEndpoint {
+                name: "OpenAI: GPT-4".to_string(),
+                provider_name: "OpenAI".to_string(),
+                slug: "openai".to_string(),
+                context_length: 8192,
+                max_completion_tokens: None,
+                quantization: None,
+                service_tier: None,
+                status: None,
+                supported_parameters: Vec::new(),
+                pricing: ProviderPricing {
+                    prompt: 0.00003,
+                    completion: 0.00006,
+                    input_cache_read: Some(0.000015),
+                    input_cache_write: None,
+                    discount: 0.0,
+                },
+                throughput_last_30m: None,
+                latency_last_30m: None,
+            },
+            ProviderEndpoint {
+                name: "Groq: GPT-4".to_string(),
+                provider_name: "Groq".to_string(),
+                slug: "groq".to_string(),
+                context_length: 8192,
+                max_completion_tokens: None,
+                quantization: None,
+                service_tier: None,
+                status: None,
+                supported_parameters: Vec::new(),
+                pricing: ProviderPricing {
+                    prompt: 0.00003,
+                    completion: 0.00006,
+                    input_cache_read: None,
+                    input_cache_write: None,
+                    discount: 0.0,
+                },
+                throughput_last_30m: None,
+                latency_last_30m: None,
+            },
+        ];
+
+        let options =
+            upstream_providers_from_endpoints(&endpoints, &HashMap::new(), "openai/gpt-4");
+
+        // Without rate data the list input price stands in and the rate is
+        // unknown.
+        let pricing = &options
+            .iter()
+            .find(|provider| provider.id == "openai")
+            .expect("the openai endpoint has prices")
+            .pricing;
+        assert_eq!(pricing.cache_hit_rate, None);
+        assert_eq!(pricing.effective_input(), 30.0);
+        // 30 + 0.01 * 60
+        assert!((pricing.blended() - 30.6).abs() < 1e-9);
+
+        // An endpoint that cannot cache has a rate of exactly zero.
+        let pricing = &options
+            .iter()
+            .find(|provider| provider.id == "groq")
+            .expect("the groq endpoint has prices")
+            .pricing;
+        assert_eq!(pricing.cache_hit_rate, Some(0.0));
+        assert_eq!(pricing.effective_input(), 30.0);
+    }
+
+    #[test]
+    fn upstream_providers_cap_the_calibrated_cache_hit_rate() {
+        let endpoints = vec![ProviderEndpoint {
+            name: "OpenAI: GPT-4".to_string(),
+            provider_name: "OpenAI".to_string(),
+            slug: "openai".to_string(),
+            context_length: 8192,
+            max_completion_tokens: None,
+            quantization: None,
+            service_tier: None,
+            status: None,
+            supported_parameters: Vec::new(),
+            pricing: ProviderPricing {
+                prompt: 0.00003,
+                completion: 0.00006,
+                input_cache_read: Some(0.000015),
+                input_cache_write: None,
+                discount: 0.0,
+            },
+            throughput_last_30m: None,
+            latency_last_30m: None,
+        }];
+
+        let options = upstream_providers_from_endpoints(
+            &endpoints,
+            &HashMap::from([(
+                "openai".to_string(),
+                FrontendEndpoint {
+                    provider_name: Some("OpenAI".to_string()),
+                    cache_hit_rate: Some(1.0),
+                    region: None,
+                    service_tier: None,
+                    headquarters: None,
+                    datacenters: Vec::new(),
+                    icon_url: None,
+                    pricing: None,
+                },
+            )]),
+            "openai/gpt-4",
+        );
+
+        let pricing = &options[0].pricing;
+        // A global rate of 100% is capped at the plausible maximum.
+        assert_eq!(pricing.cache_hit_rate, Some(0.99));
+        // 0.99 * 15 + 0.01 * 30
+        assert!((pricing.effective_input() - 15.15).abs() < 1e-9);
+    }
+
+    #[gpui::test]
+    async fn upstream_provider_reports_endpoint_limits(cx: &mut gpui::TestAppContext) {
+        let provider = provider_with_http(cx, |request| {
+            let path = request.uri().path();
+            if path.contains("/stats/") {
+                // The website stats are not needed for this test.
+                http_client::Response::builder()
+                    .status(404)
+                    .body(http_client::AsyncBody::from(
+                        r#"{"error":{"code":404,"message":"not found"}}"#,
+                    ))
+                    .expect("error response")
+            } else if path.ends_with("/endpoints") {
+                http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(
+                        ENDPOINTS_RESPONSE_WITH_PRICING,
+                    ))
+                    .expect("endpoints response")
+            } else {
+                http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(MODELS_RESPONSE))
+                    .expect("models response")
+            }
+        });
+        let model = authenticated_model(&provider, cx).await;
+
+        let unknown = cx.update(|cx| provider.upstream_provider(&model, "openai", cx));
+        assert_eq!(
+            unknown, None,
+            "limits are unknown before the list is fetched"
+        );
+
+        let listed = cx
+            .update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers")
+            .expect("providers are listed")
+            .into_iter()
+            .find(|provider| provider.id == "openai")
+            .expect("openai is listed");
+        let single = cx
+            .update(|cx| provider.upstream_provider(&model, "openai", cx))
+            .expect("the provider is known after the list is fetched");
+
+        assert_eq!(single, listed);
+        assert_eq!(single.context_length, 8192);
+    }
+
+    #[gpui::test]
+    async fn upstream_providers_are_none_for_configured_models(cx: &mut gpui::TestAppContext) {
+        let provider = cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+
+            let content = serde_json::json!({
+                "language_models": {
+                    "open_router": {
+                        "available_models": [{
+                            "name": "openai/gpt-4",
+                            "max_tokens": 8192,
+                            "provider": {
+                                "only": ["openai"]
+                            }
+                        }]
+                    }
+                }
+            })
+            .to_string();
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(&content, cx)
+                    .expect("failed to parse test settings");
+            });
+
+            let http_client = http_client::FakeHttpClient::create(|_request| async move {
+                unreachable!("upstream providers must not be fetched when only is configured")
+            });
+            OpenRouterLanguageModelProvider::new(http_client, Arc::new(TestCredentialsProvider), cx)
+        });
+
+        let model = cx.update(|cx| {
+            provider
+                .provided_models(cx)
+                .into_iter()
+                .find(|model| model.id().0.as_ref() == "openai/gpt-4")
+                .expect("model from settings")
+        });
+
+        let options = cx
+            .update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers");
+
+        assert!(options.is_none());
+    }
+
+    const MODELS_RESPONSE: &str = r#"{
+        "data": [
+            {
+                "id": "openai/gpt-4",
+                "name": "OpenAI: GPT-4",
+                "canonical_slug": "openai/gpt-4-canonical",
+                "created": 0,
+                "description": "",
+                "context_length": 8192,
+                "supported_parameters": ["tools"]
+            }
+        ]
+    }"#;
+
+    const ENDPOINTS_RESPONSE_WITH_PRICING: &str = r#"{
+        "data": {
+            "id": "openai/gpt-4",
+            "name": "GPT-4",
+            "endpoints": [
+                {
+                    "name": "OpenAI: GPT-4",
+                    "provider_name": "OpenAI",
+                    "tag": "openai",
+                    "context_length": 8192,
+                    "status": 0,
+                    "supported_parameters": ["tools"],
+                    "pricing": {
+                        "prompt": "0.00003",
+                        "completion": "0.00006",
+                        "input_cache_read": "0.000015"
+                    }
+                }
+            ]
+        }
+    }"#;
+
+    const FRONTEND_ENDPOINTS_RESPONSE: &str = r#"{
+        "data": [
+            {
+                "id": "endpoint-1",
+                "name": "OpenAI: GPT-4",
+                "provider_slug": "openai",
+                "provider_region": "us",
+                "provider_info": {
+                    "headquarters": "US",
+                    "datacenters": ["US"],
+                    "icon": {"url": "https://example.com/openai.png"}
+                }
+            }
+        ]
+    }"#;
+
+    const CACHE_HIT_RATES_RESPONSE: &str = r#"{
+        "data": [
+            {"x": "2026-10-25 00:00:00", "y": {"endpoint-1": 80.0}},
+            {"x": "2026-10-26 00:00:00", "y": {"endpoint-1": 100.0}}
+        ]
+    }"#;
+
+    /// Builds a provider whose HTTP client answers model and endpoint requests
+    /// through `handler`.
+    fn provider_with_http(
+        cx: &mut gpui::TestAppContext,
+        handler: impl Fn(
+            http_client::Request<http_client::AsyncBody>,
+        ) -> http_client::Response<http_client::AsyncBody>
+        + Send
+        + Sync
+        + 'static,
+    ) -> OpenRouterLanguageModelProvider {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            let http_client = http_client::FakeHttpClient::create(move |request| {
+                let response = handler(request);
+                async move { Ok(response) }
+            });
+            OpenRouterLanguageModelProvider::new(http_client, Arc::new(TestCredentialsProvider), cx)
+        })
+    }
+
+    async fn authenticated_model(
+        provider: &OpenRouterLanguageModelProvider,
+        cx: &mut gpui::TestAppContext,
+    ) -> LanguageModel {
+        cx.update(|cx| provider.set_api_key(Some("test-key".to_string()), cx))
+            .await
+            .expect("api key");
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            provider
+                .provided_models(cx)
+                .into_iter()
+                .find(|model| model.id().0.as_ref() == "openai/gpt-4")
+                .expect("model from the fetched list")
+        })
+    }
+
+    #[gpui::test]
+    async fn upstream_providers_are_cached_for_an_hour(cx: &mut gpui::TestAppContext) {
+        let endpoint_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fail_endpoints = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let counter = endpoint_requests.clone();
+        let failing = fail_endpoints.clone();
+        let provider = provider_with_http(cx, move |request| {
+            let path = request.uri().path();
+            if path.contains("/stats/") {
+                // The website stats are not needed for this test.
+                return http_client::Response::builder()
+                    .status(404)
+                    .body(http_client::AsyncBody::from(
+                        r#"{"error":{"code":404,"message":"not found"}}"#,
+                    ))
+                    .expect("error response");
+            }
+            if !path.ends_with("/endpoints") {
+                return http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(MODELS_RESPONSE))
+                    .expect("models response");
+            }
+
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return http_client::Response::builder()
+                    .status(500)
+                    .body(http_client::AsyncBody::from(
+                        r#"{"error":{"code":500,"message":"boom"}}"#,
+                    ))
+                    .expect("error response");
+            }
+            http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::from(
+                    ENDPOINTS_RESPONSE_WITH_PRICING,
+                ))
+                .expect("endpoints response")
+        });
+
+        let model = authenticated_model(&provider, cx).await;
+        let requests = || endpoint_requests.load(std::sync::atomic::Ordering::SeqCst);
+
+        let first = cx
+            .update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers")
+            .expect("providers are listed");
+        assert_eq!(requests(), 1);
+
+        cx.update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers");
+        assert_eq!(requests(), 1, "a read inside the TTL uses the cache");
+
+        cx.executor()
+            .advance_clock(PROVIDER_ENDPOINTS_TTL + Duration::from_secs(1));
+        cx.update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers");
+        assert_eq!(requests(), 2, "a read after the TTL fetches again");
+
+        cx.executor()
+            .advance_clock(PROVIDER_ENDPOINTS_TTL + Duration::from_secs(1));
+        fail_endpoints.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stale = cx
+            .update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("a failed refresh must not hide the cached list")
+            .expect("providers are still listed");
+        assert_eq!(stale, first);
+    }
+
+    #[gpui::test]
+    async fn upstream_providers_include_calibrated_pricing(cx: &mut gpui::TestAppContext) {
+        let frontend_uris = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = frontend_uris.clone();
+        let provider = provider_with_http(cx, move |request| {
+            let path = request.uri().path().to_string();
+            if path.contains("/stats/") {
+                captured
+                    .lock()
+                    .expect("captured uris lock")
+                    .push(request.uri().to_string());
+                if path.contains("/stats/endpoint") {
+                    http_client::Response::builder()
+                        .status(200)
+                        .body(http_client::AsyncBody::from(FRONTEND_ENDPOINTS_RESPONSE))
+                        .expect("frontend endpoints response")
+                } else {
+                    http_client::Response::builder()
+                        .status(200)
+                        .body(http_client::AsyncBody::from(CACHE_HIT_RATES_RESPONSE))
+                        .expect("cache hit rates response")
+                }
+            } else if path.ends_with("/endpoints") {
+                http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(
+                        ENDPOINTS_RESPONSE_WITH_PRICING,
+                    ))
+                    .expect("endpoints response")
+            } else {
+                http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(MODELS_RESPONSE))
+                    .expect("models response")
+            }
+        });
+        let model = authenticated_model(&provider, cx).await;
+
+        let listed = cx
+            .update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers")
+            .expect("providers are listed")
+            .into_iter()
+            .find(|provider| provider.id == "openai")
+            .expect("openai is listed");
+        let pricing = &listed.pricing;
+
+        assert_eq!(pricing.input, 30.0);
+        assert_eq!(pricing.output, 60.0);
+        assert_eq!(pricing.cache_read, Some(15.0));
+        // No personal measurement for this model: the global rate stands in.
+        assert_eq!(pricing.cache_hit_rate, Some(0.9));
+        // 0.9 * 15 + 0.1 * 30
+        assert!((pricing.effective_input() - 16.5).abs() < 1e-9);
+        // 16.5 + 0.01 * 60
+        assert!((pricing.blended() - 17.1).abs() < 1e-9);
+        assert_eq!(listed.region.as_deref(), Some("us"));
+        assert_eq!(listed.headquarters.as_deref(), Some("US"));
+        assert_eq!(listed.datacenters, vec!["US".to_string()]);
+        assert_eq!(
+            listed.icon_url.as_deref(),
+            Some("https://example.com/openai.png")
+        );
+
+        // The website stats are queried with the canonical slug, not the
+        // model id.
+        let uris = frontend_uris.lock().expect("captured uris lock").clone();
+        assert_eq!(uris.len(), 2);
+        assert!(
+            uris.iter()
+                .all(|uri| uri.contains("permaslug=openai%2Fgpt-4-canonical"))
         );
     }
 }

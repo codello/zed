@@ -612,7 +612,7 @@ pub struct OpenRouterAvailableModel {
 }
 
 #[with_fallible_options]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct OpenRouterProvider {
     order: Option<Vec<String>>,
     #[serde(default = "default_true")]
@@ -621,7 +621,7 @@ pub struct OpenRouterProvider {
     require_parameters: bool,
     #[serde(default)]
     data_collection: DataCollection,
-    only: Option<Vec<String>>,
+    pub only: Option<Vec<String>>,
     ignore: Option<Vec<String>>,
     quantizations: Option<Vec<String>>,
     sort: Option<String>,

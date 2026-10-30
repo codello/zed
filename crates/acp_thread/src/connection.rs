@@ -709,6 +709,31 @@ pub trait AgentModelSelector: 'static {
     /// A task resolving to the selected model (always set) or an error (e.g., session not found).
     fn selected_model(&self, cx: &mut App) -> Task<Result<AgentModelInfo>>;
 
+    /// Lists the upstream providers that can serve `model_id`.
+    ///
+    /// Returns `None` when no choice is required.
+    fn upstream_providers(
+        &self,
+        _model_id: &AgentModelId,
+        _cx: &mut App,
+    ) -> Task<Result<Option<Vec<AgentUpstreamProvider>>>> {
+        Task::ready(Ok(None))
+    }
+
+    /// The upstream provider selected for this session, if any.
+    fn selected_upstream_provider(&self, _cx: &mut App) -> Task<Result<Option<String>>> {
+        Task::ready(Ok(None))
+    }
+
+    /// Selects the upstream provider for this session.
+    fn select_upstream_provider(
+        &self,
+        _provider: Option<String>,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
     fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<AgentModelId> {
         HashSet::default()
     }
@@ -746,6 +771,86 @@ pub struct AgentModelInfo {
     pub is_latest: bool,
     pub cost: Option<SharedString>,
     pub disabled: Option<DisabledReason>,
+}
+
+/// An upstream provider that can serve a model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentUpstreamProvider {
+    /// The value used in provider routing, for example `openai`.
+    pub id: String,
+    /// The name shown to users, for example `OpenAI`.
+    pub name: SharedString,
+    /// The service tier of the endpoint, for example `flex` or `spot`, when
+    /// it is not the standard tier.
+    pub service_tier: Option<SharedString>,
+    /// The quantization the endpoint runs with, for example `fp8`, when
+    /// known.
+    pub quantization: Option<SharedString>,
+    /// The region the endpoint runs in, for example `us` or `eu`, when
+    /// reported.
+    pub region: Option<SharedString>,
+    /// The country the company operating the endpoint is headquartered in,
+    /// for example `us`, when reported.
+    pub headquarters: Option<SharedString>,
+    /// The countries the endpoint processes requests in.
+    pub datacenters: Vec<SharedString>,
+    /// URL of the provider's icon, when reported.
+    pub icon_url: Option<SharedString>,
+    pub pricing: Option<AgentUpstreamProviderPricing>,
+    /// Average tokens per second throughput over the last 30m
+    pub throughput: Option<f64>,
+    /// Average time to first token in milliseconds over the last 30m
+    pub latency: Option<f64>,
+}
+
+/// Pricing for an upstream provider, in USD per million tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentUpstreamProviderPricing {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    /// The price of writing tokens to the cache, when the provider charges
+    /// for writes.
+    pub cache_write: Option<f64>,
+    pub discount: Option<f64>,
+    /// The input price after weighting by the expected cache hit rate.
+    pub effective_input: Option<f64>,
+    /// The cache hit rate used to compute `effective_input`: the global
+    /// rate of the last week, scaled by the workload calibration.
+    pub cache_hit_rate: Option<f64>,
+    /// The estimated cost per million input tokens: the effective input
+    /// price plus the output price weighted by the output-to-input token
+    /// ratio.
+    pub blended: Option<f64>,
+}
+
+impl AgentUpstreamProviderPricing {
+    /// Whether at least one price is set. The discount does not count.
+    pub fn has_prices(&self) -> bool {
+        self.blended.is_some()
+            || self.effective_input.is_some()
+            || self.input.is_some()
+            || self.output.is_some()
+            || self.cache_read.is_some()
+    }
+
+    /// Returns the difference to `other`.
+    pub fn difference(&self, other: &Self) -> Self {
+        let subtract = |price: Option<f64>, other: Option<f64>| {
+            price.zip(other).map(|(price, other)| price - other)
+        };
+
+        Self {
+            input: subtract(self.input, other.input),
+            output: subtract(self.output, other.output),
+            cache_read: subtract(self.cache_read, other.cache_read),
+            cache_write: subtract(self.cache_write, other.cache_write),
+            discount: None,
+            effective_input: subtract(self.effective_input, other.effective_input),
+            cache_hit_rate: subtract(self.cache_hit_rate, other.cache_hit_rate),
+            blended: subtract(self.blended, other.blended),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1736,6 +1841,40 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn pricing_difference_subtracts_each_field() {
+        let pricing = AgentUpstreamProviderPricing {
+            input: Some(0.5),
+            output: Some(0.25),
+            cache_read: Some(0.125),
+            cache_write: None,
+            discount: None,
+            effective_input: Some(0.4),
+            cache_hit_rate: Some(1.0),
+            blended: Some(0.5),
+        };
+        let other = AgentUpstreamProviderPricing {
+            input: Some(0.25),
+            output: None,
+            cache_read: Some(0.125),
+            cache_write: None,
+            discount: Some(0.25),
+            effective_input: None,
+            cache_hit_rate: Some(0.75),
+            blended: Some(0.25),
+        };
+
+        let difference = pricing.difference(&other);
+
+        assert_eq!(difference.input, Some(0.25));
+        assert_eq!(difference.output, None);
+        assert_eq!(difference.cache_read, Some(0.0));
+        assert_eq!(difference.discount, None);
+        assert_eq!(difference.effective_input, None);
+        assert_eq!(difference.cache_hit_rate, Some(0.25));
+        assert_eq!(difference.blended, Some(0.25));
+    }
 
     #[test]
     fn session_info_id_preserves_backing_arc_and_legacy_serialization() {

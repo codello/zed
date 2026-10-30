@@ -560,6 +560,26 @@ pub trait LanguageModelProvider: LanguageModelClient {
         Vec::new()
     }
 
+    /// Lists the upstream providers that can serve `model`.
+    fn upstream_providers(
+        &self,
+        _model: &LanguageModel,
+        _cx: &mut App,
+    ) -> Task<Result<Option<Vec<UpstreamProvider>>>> {
+        Task::ready(Ok(None))
+    }
+
+    /// The upstream provider `provider` that serves `model`, if its details are
+    /// known.
+    fn upstream_provider(
+        &self,
+        _model: &LanguageModel,
+        _provider: &str,
+        _cx: &App,
+    ) -> Option<UpstreamProvider> {
+        None
+    }
+
     fn is_authenticated(&self, cx: &App) -> bool;
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>>;
     fn refresh_models(&self, _cx: &mut App) {}

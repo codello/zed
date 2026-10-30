@@ -19,6 +19,20 @@ pub use settings::OpenRouterProvider as Provider;
 use std::{convert::TryFrom, io, time::Duration};
 use thiserror::Error;
 
+mod analytics;
+mod frontend_stats;
+mod personal_stats;
+mod provider_endpoints;
+
+pub use analytics::{AnalyticsRow, query_analytics};
+pub use frontend_stats::{FrontendEndpoint, FrontendPricing, list_frontend_endpoints};
+pub use personal_stats::{
+    PersonalCacheStats, PersonalMeasurement, fetch_usage_measurements, personal_cache_stats,
+};
+pub use provider_endpoints::{
+    PercentileStats, ProviderEndpoint, ProviderPricing, list_provider_endpoints,
+};
+
 pub const OPEN_ROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 const OPEN_ROUTER_APP_TITLE: &str = "Zed";
 
@@ -78,6 +92,9 @@ impl From<Role> for String {
 pub struct Model {
     pub name: String,
     pub display_name: Option<String>,
+    /// The dated slug that OpenRouter's website APIs key their stats on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_slug: Option<String>,
     pub max_tokens: u64,
     pub supports_tools: Option<bool>,
     pub supports_images: Option<bool>,
@@ -123,6 +140,7 @@ impl Model {
         Self {
             name: name.to_owned(),
             display_name: display_name.map(|s| s.to_owned()),
+            canonical_slug: None,
             max_tokens: max_tokens.unwrap_or(2000000),
             supports_tools,
             supports_images,
@@ -427,6 +445,8 @@ pub struct ModelEntry {
     pub created: usize,
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_parameters: Vec<String>,
@@ -564,6 +584,7 @@ pub async fn list_models(
                         .trim()
                         .to_string(),
                 ),
+                canonical_slug: entry.canonical_slug,
                 max_tokens: entry.context_length.unwrap_or(2000000),
                 supports_tools: Some(entry.supported_parameters.contains(&"tools".to_string())),
                 supports_images: Some(
@@ -629,6 +650,12 @@ pub async fn list_models(
 pub enum OpenRouterError {
     /// Failed to construct the HTTP request body
     BuildRequestBody(http::Error),
+
+    /// Failed to serialize the request body
+    SerializeBody(serde_json::Error),
+
+    /// Failed to construct the request URL
+    BuildUrl(url::ParseError),
 
     /// Failed to send the HTTP request
     HttpSend { host: String, error: anyhow::Error },
@@ -718,6 +745,8 @@ impl From<OpenRouterError> for language_model_core::LanguageModelCompletionError
         let provider = language_model_core::LanguageModelProviderName::new("OpenRouter");
         match error {
             OpenRouterError::BuildRequestBody(error) => Self::BuildRequestBody { provider, error },
+            OpenRouterError::SerializeBody(error) => Self::Other(error.into()),
+            OpenRouterError::BuildUrl(error) => Self::Other(error.into()),
             OpenRouterError::HttpSend { host, error } => Self::HttpSend {
                 provider,
                 host,

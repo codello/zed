@@ -9655,6 +9655,7 @@ dependencies = [
  "paths",
  "rand 0.9.4",
  "release_channel",
+ "scheduler",
  "schemars 1.0.4",
  "serde",
  "serde_json",
@@ -12216,15 +12217,21 @@ name = "open_router"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "futures 0.3.34",
  "http_client",
  "language_model_core",
  "open_ai",
+ "reqwest_client",
+ "rpassword",
  "schemars 1.0.4",
  "serde",
  "serde_json",
+ "serde_json_lenient",
  "settings",
  "thiserror 2.0.17",
+ "time",
+ "url",
 ]
 
 [[package]]
