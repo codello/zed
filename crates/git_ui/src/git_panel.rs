@@ -4636,6 +4636,7 @@ impl GitPanel {
                     thinking_allowed: false,
                     thinking_effort: None,
                     speed: None,
+                    upstream_provider: None,
                     compact_at_tokens: None,
                     max_output_tokens: None,
                 };

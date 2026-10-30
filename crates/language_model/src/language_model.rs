@@ -547,6 +547,30 @@ pub trait LanguageModelClient: 'static {
     }
 }
 
+/// An upstream provider that can serve a model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpstreamProvider {
+    /// The value used in provider routing, for example `openai`.
+    pub id: String,
+    /// The name shown to users, for example `OpenAI`.
+    pub name: String,
+    /// Short labels that distinguish variants, for example `fp8` or `flex`.
+    pub tags: Vec<String>,
+    pub pricing: Option<UpstreamProviderPricing>,
+    pub throughput: Option<f64>,
+    pub latency: Option<f64>,
+    pub context_length: Option<u64>,
+}
+
+/// Pricing for an upstream provider, in USD per million tokens.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpstreamProviderPricing {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub discount: Option<f64>,
+}
+
 pub trait LanguageModelProvider: LanguageModelClient {
     fn id(&self) -> LanguageModelProviderId;
     fn name(&self) -> LanguageModelProviderName;
@@ -558,6 +582,26 @@ pub trait LanguageModelProvider: LanguageModelClient {
     fn provided_models(&self, cx: &App) -> Vec<LanguageModel>;
     fn recommended_models(&self, _cx: &App) -> Vec<LanguageModel> {
         Vec::new()
+    }
+
+    /// Lists the upstream providers that can serve `model`.
+    fn upstream_providers(
+        &self,
+        _model: &LanguageModel,
+        _cx: &mut App,
+    ) -> Task<Result<Option<Vec<UpstreamProvider>>>> {
+        Task::ready(Ok(None))
+    }
+
+    /// The upstream provider `provider` that serves `model`, if its details are
+    /// known.
+    fn upstream_provider(
+        &self,
+        _model: &LanguageModel,
+        _provider: &str,
+        _cx: &App,
+    ) -> Option<UpstreamProvider> {
+        None
     }
 
     fn is_authenticated(&self, cx: &App) -> bool;

@@ -19,6 +19,12 @@ pub use settings::OpenRouterProvider as Provider;
 use std::{convert::TryFrom, io, time::Duration};
 use thiserror::Error;
 
+mod provider_endpoints;
+
+pub use provider_endpoints::{
+    PercentileStats, ProviderEndpoint, ProviderPricing, list_provider_endpoints,
+};
+
 pub const OPEN_ROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 const OPEN_ROUTER_APP_TITLE: &str = "Zed";
 

@@ -670,6 +670,31 @@ pub trait AgentModelSelector: 'static {
     /// A task resolving to the selected model (always set) or an error (e.g., session not found).
     fn selected_model(&self, cx: &mut App) -> Task<Result<AgentModelInfo>>;
 
+    /// Lists the upstream providers that can serve `model_id`.
+    ///
+    /// Returns `None` when no choice is required.
+    fn upstream_providers(
+        &self,
+        _model_id: &AgentModelId,
+        _cx: &mut App,
+    ) -> Task<Result<Option<Vec<AgentUpstreamProvider>>>> {
+        Task::ready(Ok(None))
+    }
+
+    /// The upstream provider selected for this session, if any.
+    fn selected_upstream_provider(&self, _cx: &mut App) -> Task<Result<Option<String>>> {
+        Task::ready(Ok(None))
+    }
+
+    /// Selects the upstream provider for this session.
+    fn select_upstream_provider(
+        &self,
+        _provider: Option<String>,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
     fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<AgentModelId> {
         HashSet::default()
     }
@@ -707,6 +732,52 @@ pub struct AgentModelInfo {
     pub is_latest: bool,
     pub cost: Option<SharedString>,
     pub disabled: Option<DisabledReason>,
+}
+
+/// An upstream provider that can serve a model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentUpstreamProvider {
+    /// The value used in provider routing, for example `openai`.
+    pub id: String,
+    /// The name shown to users, for example `OpenAI`.
+    pub name: SharedString,
+    /// Short labels that distinguish variants, for example `fp8` or `flex`.
+    pub tags: Vec<SharedString>,
+    pub pricing: Option<AgentUpstreamProviderPricing>,
+    /// Average tokens per second throughput over the last 30m
+    pub throughput: Option<f64>,
+    /// Average time to first token in milliseconds over the last 30m
+    pub latency: Option<f64>,
+}
+
+/// Pricing for an upstream provider, in USD per million tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentUpstreamProviderPricing {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub discount: Option<f64>,
+}
+
+impl AgentUpstreamProviderPricing {
+    /// Whether at least one price is set. The discount does not count.
+    pub fn has_prices(&self) -> bool {
+        self.input.is_some() || self.output.is_some() || self.cache_read.is_some()
+    }
+
+    /// Returns the difference to `other`.
+    pub fn difference(&self, other: &Self) -> Self {
+        let subtract = |price: Option<f64>, other: Option<f64>| {
+            price.zip(other).map(|(price, other)| price - other)
+        };
+
+        Self {
+            input: subtract(self.input, other.input),
+            output: subtract(self.output, other.output),
+            cache_read: subtract(self.cache_read, other.cache_read),
+            discount: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1697,6 +1768,29 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn pricing_difference_subtracts_each_field() {
+        let pricing = AgentUpstreamProviderPricing {
+            input: Some(0.5),
+            output: Some(0.25),
+            cache_read: Some(0.125),
+            discount: None,
+        };
+        let other = AgentUpstreamProviderPricing {
+            input: Some(0.25),
+            output: None,
+            cache_read: Some(0.125),
+            discount: Some(0.25),
+        };
+
+        let difference = pricing.difference(&other);
+
+        assert_eq!(difference.input, Some(0.25));
+        assert_eq!(difference.output, None);
+        assert_eq!(difference.cache_read, Some(0.0));
+        assert_eq!(difference.discount, None);
+    }
 
     #[test]
     fn session_info_id_preserves_backing_arc_and_legacy_serialization() {

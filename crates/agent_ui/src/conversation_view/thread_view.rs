@@ -749,6 +749,7 @@ pub struct ThreadView {
     pub config_options_view: Option<Entity<ConfigOptionsView>>,
     pub mode_selector: Option<Entity<ModeSelector>>,
     pub model_selector: Option<Entity<ModelSelectorPopover>>,
+    pub upstream_provider_selector: Option<Entity<UpstreamProviderSelector>>,
     pub profile_selector: Option<Entity<ProfileSelector>>,
     pub permission_dropdown_handle: PopoverMenuHandle<ContextMenu>,
     pub thread_retry_status: Option<RetryStatus>,
@@ -1018,6 +1019,7 @@ impl ThreadView {
         config_options_view: Option<Entity<ConfigOptionsView>>,
         mode_selector: Option<Entity<ModeSelector>>,
         model_selector: Option<Entity<ModelSelectorPopover>>,
+        upstream_provider_selector: Option<Entity<UpstreamProviderSelector>>,
         profile_selector: Option<Entity<ProfileSelector>>,
         list_state: ListState,
         session_capabilities: SharedSessionCapabilities,
@@ -1253,6 +1255,25 @@ impl ThreadView {
             .recoverable_submissions()
             .map(|(submission_id, _)| submission_id)
             .collect();
+        if let Some(upstream_provider_selector) = &upstream_provider_selector
+            && let Some(native_thread) = thread
+                .read(cx)
+                .connection()
+                .clone()
+                .downcast::<agent::NativeAgentConnection>()
+                .and_then(|connection| connection.thread(thread.read(cx).session_id(), cx))
+        {
+            let upstream_provider_selector = upstream_provider_selector.clone();
+            subscriptions.push(cx.subscribe_in(
+                &native_thread,
+                window,
+                move |_, _, _: &agent::ModelChanged, window, cx| {
+                    upstream_provider_selector
+                        .update(cx, |selector, cx| selector.refresh(window, cx));
+                },
+            ));
+        }
+
         let mut this = Self {
             root_thread_id,
             session_id,
@@ -1272,6 +1293,7 @@ impl ThreadView {
             config_options_view,
             mode_selector,
             model_selector,
+            upstream_provider_selector,
             profile_selector,
             list_state,
             session_capabilities,
@@ -5570,7 +5592,8 @@ impl ThreadView {
                                         Some(config_view) => this.child(config_view),
                                         None => this
                                             .children(self.mode_selector.clone())
-                                            .children(self.model_selector.clone()),
+                                            .children(self.model_selector.clone())
+                                            .children(self.upstream_provider_selector.clone()),
                                     })
                                     .child(self.render_send_button(cx)),
                             ),

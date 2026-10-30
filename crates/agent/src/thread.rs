@@ -26,6 +26,7 @@ use chrono::{DateTime, Local, Utc};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::{HashMap, HashSet, IndexMap};
+use db::kvp::KeyValueStore;
 use fs::Fs;
 use futures::{
     FutureExt,
@@ -1293,6 +1294,7 @@ pub(crate) struct StreamingSaveKey {
     speed: Option<Speed>,
     thinking_enabled: bool,
     thinking_effort: Option<String>,
+    upstream_provider: Option<String>,
     sandboxed_terminal_temp_dir: Option<PathBuf>,
     sandbox_grants: crate::db::DbSandboxGrants,
 }
@@ -1345,6 +1347,7 @@ pub struct Thread {
     thinking_enabled: bool,
     thinking_effort: Option<String>,
     speed: Option<Speed>,
+    upstream_provider: Option<String>,
     prompt_capabilities_tx: watch::Sender<acp_v2::PromptCapabilities>,
     pub(crate) prompt_capabilities_rx: watch::Receiver<acp_v2::PromptCapabilities>,
     pub(crate) project: Entity<Project>,
@@ -1454,6 +1457,11 @@ impl Thread {
             .default_model
             .as_ref()
             .and_then(|model| model.speed);
+        let remembered_provider = model
+            .as_ref()
+            .and_then(|model| Self::remembered_upstream_provider(model, cx));
+        let model =
+            model.map(|model| Self::effective_model(model, remembered_provider.as_deref(), cx));
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
             watch::channel(Self::prompt_capabilities(model.as_ref()));
         let model = match model {
@@ -1497,6 +1505,7 @@ impl Thread {
             summarization_model: None,
             thinking_enabled: enable_thinking,
             speed,
+            upstream_provider: remembered_provider,
             thinking_effort,
             prompt_capabilities_tx,
             prompt_capabilities_rx,
@@ -1519,6 +1528,7 @@ impl Thread {
     fn inherit_parent_settings(&mut self, parent_thread: &Entity<Thread>, cx: &mut Context<Self>) {
         let parent = parent_thread.read(cx);
         self.speed = parent.speed;
+        self.upstream_provider = parent.upstream_provider.clone();
         self.thinking_enabled = parent.thinking_enabled;
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
@@ -1837,7 +1847,7 @@ impl Thread {
         let context_usage =
             context_usage_from_history(&db_thread.messages, &db_thread.request_token_usage);
 
-        Self {
+        let mut thread = Self {
             id,
             prompt_id: PromptId::new(),
             title: if db_thread.title.is_empty() {
@@ -1872,6 +1882,7 @@ impl Thread {
             thinking_enabled: db_thread.thinking_enabled,
             thinking_effort: db_thread.thinking_effort,
             speed: db_thread.speed,
+            upstream_provider: db_thread.upstream_provider,
             project,
             action_log,
             updated_at: db_thread.updated_at,
@@ -1889,7 +1900,13 @@ impl Thread {
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
             ))),
+        };
+        if let Some(model) = thread.model().cloned() {
+            let model = Thread::effective_model(model, thread.upstream_provider.as_deref(), cx);
+            thread.model = ThreadModel::Ready(model);
+            thread.refresh_upstream_providers(cx);
         }
+        thread
     }
 
     pub fn sandbox_status(&self, cx: &App) -> Option<(ThreadSandbox, ThreadSandbox)> {
@@ -1979,6 +1996,7 @@ impl Thread {
             speed: self.speed,
             thinking_enabled: self.thinking_enabled,
             thinking_effort: self.thinking_effort.clone(),
+            upstream_provider: self.upstream_provider.clone(),
             draft_prompt: self.draft_prompt.clone(),
             ui_scroll_position: self.ui_scroll_position.map(|lo| {
                 crate::db::SerializedScrollPosition {
@@ -2012,6 +2030,7 @@ impl Thread {
             speed: self.speed,
             thinking_enabled: self.thinking_enabled,
             thinking_effort: self.thinking_effort.clone(),
+            upstream_provider: self.upstream_provider.clone(),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
         }
@@ -2092,6 +2111,10 @@ impl Thread {
 
     pub fn set_model(&mut self, model: LanguageModel, cx: &mut Context<Self>) {
         let old_usage = self.latest_token_usage();
+        if self.model().is_none_or(|current| current.id != model.id) {
+            self.upstream_provider = Self::remembered_upstream_provider(&model, cx);
+        }
+        let model = Self::effective_model(model, self.upstream_provider.as_deref(), cx);
         self.model = ThreadModel::Ready(model.clone());
         let new_caps = Self::prompt_capabilities(self.model.as_model());
         let new_usage = self.latest_token_usage();
@@ -2132,6 +2155,7 @@ impl Thread {
         else {
             return;
         };
+        let model = Self::effective_model(model, self.upstream_provider.as_deref(), cx);
         if model == *current {
             return;
         }
@@ -2209,6 +2233,118 @@ impl Thread {
                 .update(cx, |thread, cx| {
                     if thread.inherits_parent_model_settings {
                         thread.set_speed(speed, cx);
+                    }
+                })
+                .ok();
+        }
+        cx.notify();
+    }
+
+    pub fn upstream_provider(&self) -> Option<&str> {
+        self.upstream_provider.as_deref()
+    }
+
+    /// The key under which the last upstream provider the user picked for a
+    /// model is remembered across threads and restarts.
+    pub(crate) fn upstream_provider_memory_key(model: &LanguageModel) -> String {
+        format!("upstream-provider:{}:{}", model.provider_id.0, model.id.0)
+    }
+
+    /// The upstream provider the user last picked for `model`, if any.
+    fn remembered_upstream_provider(model: &LanguageModel, cx: &App) -> Option<String> {
+        KeyValueStore::global(cx)
+            .read_kvp(&Self::upstream_provider_memory_key(model))
+            .log_err()
+            .flatten()
+    }
+
+    /// Records the upstream provider the user picked for `model`, or clears
+    /// the memory when they picked automatic routing.
+    pub(crate) fn remember_upstream_provider(
+        model: &LanguageModel,
+        provider: Option<String>,
+        cx: &App,
+    ) -> Task<()> {
+        let key = Self::upstream_provider_memory_key(model);
+        let db = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            match provider {
+                Some(provider) => db.write_kvp(key, provider).await,
+                None => db.delete_kvp(key).await,
+            }
+            .log_err();
+        })
+    }
+
+    /// Returns `model` with the limits of the upstream provider `provider`
+    /// applied.
+    fn effective_model(
+        mut model: LanguageModel,
+        provider: Option<&str>,
+        cx: &App,
+    ) -> LanguageModel {
+        let provider = provider.and_then(|provider| {
+            LanguageModelRegistry::read_global(cx)
+                .provider_for_model(&model)
+                .ok()
+                .and_then(|language_model_provider| {
+                    language_model_provider.upstream_provider(&model, provider, cx)
+                })
+        });
+        let Some(provider) = provider else {
+            return model;
+        };
+        if let Some(context_length) = provider.context_length {
+            model.max_token_count = context_length;
+            model.max_input_tokens = context_length;
+        }
+        model
+    }
+
+    /// Fetches the upstream provider list when this thread selected a provider,
+    /// so a restored thread learns its limits without waiting for the provider
+    /// picker to be built.
+    fn refresh_upstream_providers(&self, cx: &mut App) {
+        let Some(model) = self.model() else {
+            return;
+        };
+        if self.upstream_provider().is_none() {
+            return;
+        }
+        let Ok(provider) = LanguageModelRegistry::read_global(cx).provider_for_model(model) else {
+            return;
+        };
+        let list = provider.upstream_providers(model, cx);
+        cx.spawn(async move |_| list.await.log_err()).detach();
+    }
+
+    pub fn set_upstream_provider(&mut self, provider: Option<String>, cx: &mut Context<Self>) {
+        if self.model().is_none() {
+            return;
+        }
+        self.upstream_provider = provider.clone();
+        // Selecting a provider resolves the model again, because the limits
+        // already applied only narrow it.
+        let resolved = self.model().and_then(|current| {
+            LanguageModelRegistry::read_global(cx)
+                .provider_for_model(current)
+                .ok()
+                .and_then(|provider| {
+                    provider
+                        .provided_models(cx)
+                        .into_iter()
+                        .find(|provided| provided.id == current.id)
+                })
+        });
+        if let Some(resolved) = resolved {
+            self.set_model(resolved, cx);
+        }
+
+        for subagent in &self.running_subagents {
+            subagent
+                .update(cx, |thread, cx| {
+                    if thread.inherits_parent_model_settings {
+                        thread.set_upstream_provider(provider.clone(), cx);
                     }
                 })
                 .ok();
@@ -4437,6 +4573,9 @@ impl Thread {
                 || !model.supports_disabling_thinking_at_effort(self.thinking_effort.as_deref()),
             thinking_effort: self.thinking_effort.clone(),
             speed: self.speed(),
+            upstream_provider: self
+                .upstream_provider()
+                .map(|provider| provider.to_string()),
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -7562,6 +7701,134 @@ mod tests {
 
             (thread, event_stream, fake)
         })
+    }
+
+    #[gpui::test]
+    async fn test_new_thread_applies_remembered_upstream_provider(cx: &mut TestAppContext) {
+        let fake = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+
+            LanguageModelRegistry::test(cx)
+        });
+        let model = fake.model("upstream-provider-seed-test");
+
+        // The user previously picked a provider for this model.
+        let key = Thread::upstream_provider_memory_key(&model);
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        gpui::block_on(kvp.write_kvp(key, "chutes".to_string())).unwrap();
+
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        let templates = Templates::new();
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    Some(model.clone()),
+                    cx,
+                )
+            })
+        });
+
+        cx.update(|cx| {
+            assert_eq!(thread.read(cx).upstream_provider(), Some("chutes"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_model_change_applies_remembered_upstream_provider(cx: &mut TestAppContext) {
+        let fake = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+
+            LanguageModelRegistry::test(cx)
+        });
+        let first_model = fake.model("upstream-provider-model-change-a");
+        let second_model = fake.model("upstream-provider-model-change-b");
+
+        // The user previously picked a provider for the second model only.
+        let key = Thread::upstream_provider_memory_key(&second_model);
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        gpui::block_on(kvp.write_kvp(key, "chutes".to_string())).unwrap();
+
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        let templates = Templates::new();
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    Some(first_model.clone()),
+                    cx,
+                )
+            })
+        });
+
+        // Switching models follows the globally remembered choice for the new
+        // model, while the provider picked before the switch is kept until then.
+        cx.update(|cx| {
+            assert_eq!(thread.read(cx).upstream_provider(), None);
+            thread.update(cx, |thread, cx| thread.set_model(second_model.clone(), cx));
+            assert_eq!(thread.read(cx).upstream_provider(), Some("chutes"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_set_upstream_provider_clears_memory(cx: &mut TestAppContext) {
+        let fake = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+
+            LanguageModelRegistry::test(cx)
+        });
+        let model = fake.model("upstream-provider-clear-test");
+
+        let key = Thread::upstream_provider_memory_key(&model);
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        gpui::block_on(kvp.write_kvp(key, "chutes".to_string())).unwrap();
+
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        let templates = Templates::new();
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread = cx.update(|cx| {
+            let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+            let context_server_store = project.read(cx).context_server_store();
+            let context_server_registry =
+                cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+            cx.new(|cx| {
+                Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    templates,
+                    Some(model.clone()),
+                    cx,
+                )
+            })
+        });
+
+        // Picking automatic routing clears the thread's provider. The global
+        // memory is cleared by the model selector on top.
+        cx.update(|cx| {
+            assert_eq!(thread.read(cx).upstream_provider(), Some("chutes"));
+            thread.update(cx, |thread, cx| thread.set_upstream_provider(None, cx));
+            assert_eq!(thread.read(cx).upstream_provider(), None);
+        });
     }
 
     fn set_auto_compact_settings(cx: &mut App, auto_compact: agent_settings::AutoCompactSettings) {

@@ -3144,6 +3144,88 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
         )))
     }
 
+    fn upstream_providers(
+        &self,
+        model_id: &AgentModelId,
+        cx: &mut App,
+    ) -> Task<Result<Option<Vec<acp_thread::AgentUpstreamProvider>>>> {
+        let Some(model) = self.connection.0.read(cx).models.model_from_id(model_id) else {
+            return Task::ready(Err(anyhow!("Invalid model ID {}", model_id)));
+        };
+        let Some(provider) = LanguageModelRegistry::read_global(cx).provider(&model.provider_id())
+        else {
+            return Task::ready(Err(anyhow!("Provider not found")));
+        };
+        let task = provider.upstream_providers(&model, cx);
+        cx.spawn(async move |_cx| {
+            let providers = task.await?;
+            Ok(providers.map(|providers| {
+                providers
+                    .into_iter()
+                    .map(|provider| acp_thread::AgentUpstreamProvider {
+                        id: provider.id,
+                        name: provider.name.into(),
+                        tags: provider.tags.into_iter().map(Into::into).collect(),
+                        pricing: provider.pricing.map(|pricing| {
+                            acp_thread::AgentUpstreamProviderPricing {
+                                input: pricing.input,
+                                output: pricing.output,
+                                cache_read: pricing.cache_read,
+                                discount: pricing.discount,
+                            }
+                        }),
+                        throughput: provider.throughput,
+                        latency: provider.latency,
+                    })
+                    .collect()
+            }))
+        })
+    }
+
+    fn selected_upstream_provider(&self, cx: &mut App) -> Task<Result<Option<String>>> {
+        let Some(thread) = self
+            .connection
+            .0
+            .read(cx)
+            .sessions
+            .get(&self.session_id)
+            .map(|session| session.thread.clone())
+        else {
+            return Task::ready(Err(anyhow!("Session not found")));
+        };
+        let provider = thread
+            .read(cx)
+            .upstream_provider()
+            .map(|provider| provider.to_string());
+        Task::ready(Ok(provider))
+    }
+
+    fn select_upstream_provider(&self, provider: Option<String>, cx: &mut App) -> Task<Result<()>> {
+        let Some(thread) = self
+            .connection
+            .0
+            .read(cx)
+            .sessions
+            .get(&self.session_id)
+            .map(|session| session.thread.clone())
+        else {
+            return Task::ready(Err(anyhow!("Session not found")));
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_upstream_provider(provider.clone(), cx);
+        });
+
+        // Remember the choice per model so new threads start with it.
+        if let Some(model) = thread.read(cx).model().cloned() {
+            let memory = Thread::remember_upstream_provider(&model, provider, cx);
+            return cx.spawn(async move |_| {
+                memory.await;
+                Ok(())
+            });
+        }
+        Task::ready(Ok(()))
+    }
+
     fn favorite_model_ids(&self, cx: &mut App) -> HashSet<AgentModelId> {
         agent_settings::AgentSettings::get_global(cx)
             .favorite_model_ids()

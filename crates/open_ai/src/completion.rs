@@ -290,6 +290,7 @@ pub fn into_open_ai_response(
         thinking_allowed,
         thinking_effort,
         speed,
+        upstream_provider: _,
         compact_at_tokens,
         max_output_tokens: _,
     } = request;
@@ -1908,6 +1909,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: Some("high".into()),
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2097,6 +2099,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2200,6 +2203,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2287,6 +2291,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2355,6 +2360,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: Some("high".into()),
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2466,6 +2472,7 @@ mod tests {
                 thinking_allowed: false,
                 thinking_effort: None,
                 speed,
+                upstream_provider: None,
                 compact_at_tokens: None,
                 max_output_tokens: None,
             };
@@ -2520,6 +2527,7 @@ mod tests {
                 thinking_allowed: false,
                 thinking_effort: None,
                 speed,
+                upstream_provider: None,
                 compact_at_tokens: None,
                 max_output_tokens: None,
             };
@@ -2567,6 +2575,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2645,6 +2654,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: Some("high".into()),
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2688,6 +2698,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: Some("none".into()),
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2743,6 +2754,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2837,6 +2849,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -2929,6 +2942,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -4234,6 +4248,7 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             compact_at_tokens: None,
             max_output_tokens: None,
         };
@@ -4381,6 +4396,7 @@ mod tests {
                 reasoning_details: None,
             }],
             speed: Some(Speed::Fast),
+            upstream_provider: None,
             compact_at_tokens: Some(100_000),
             ..Default::default()
         };

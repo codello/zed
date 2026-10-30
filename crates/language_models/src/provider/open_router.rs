@@ -12,15 +12,19 @@ use language_model::{
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
     LanguageModelRequest, LanguageModelToolChoice, LanguageModelToolChoiceSupport,
     LanguageModelToolResultContent, MessageContent, ModelRateLimiters, ProviderSettingsView, Role,
-    env_var, unavailable_error,
+    UpstreamProvider, UpstreamProviderPricing, env_var, unavailable_error,
 };
 use open_router::{
-    Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ReasoningEffort,
-    ResponseStreamEvent, list_models,
+    Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ProviderEndpoint,
+    ReasoningEffort, ResponseStreamEvent, list_models, list_provider_endpoints,
 };
+use scheduler::Instant;
 use settings::{OpenRouterAvailableModel as AvailableModel, Settings, SettingsStore};
 use sha2::{Digest as _, Sha256};
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use ui::IconName;
 use util::ResultExt;
 
@@ -28,6 +32,7 @@ const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("openr
 const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("OpenRouter");
 
 const API_KEY_ENV_VAR_NAME: &str = "OPENROUTER_API_KEY";
+const PROVIDER_ENDPOINTS_TTL: Duration = Duration::from_secs(60 * 60);
 static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
 pub(crate) const RESERVED_HEADER_NAMES: &[&str] = &["HTTP-Referer", "X-Title"];
 
@@ -49,8 +54,14 @@ pub struct State {
     credentials_provider: Arc<dyn CredentialsProvider>,
     http_client: Arc<dyn HttpClient>,
     available_models: Vec<open_router::Model>,
+    upstream_providers: HashMap<String, CachedUpstreamProviders>,
     fetch_models_task: Option<Task<()>>,
     last_fetch_models_error: Option<String>,
+}
+
+struct CachedUpstreamProviders {
+    providers: Vec<UpstreamProvider>,
+    fetched_at: Instant,
 }
 
 impl State {
@@ -125,6 +136,7 @@ impl State {
     }
 
     fn restart_fetch_models_task(&mut self, cx: &mut Context<Self>) {
+        self.upstream_providers.clear();
         if self.is_authenticated() {
             let fetch_task = self.fetch_models(cx);
             let task = cx.spawn(async move |this, cx| {
@@ -169,6 +181,7 @@ impl OpenRouterLanguageModelProvider {
                 credentials_provider,
                 http_client: http_client.clone(),
                 available_models: Vec::new(),
+                upstream_providers: HashMap::default(),
                 fetch_models_task: None,
                 last_fetch_models_error: None,
             }
@@ -342,6 +355,113 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
             .collect()
     }
 
+    fn upstream_providers(
+        &self,
+        model: &LanguageModel,
+        cx: &mut App,
+    ) -> Task<Result<Option<Vec<UpstreamProvider>>>> {
+        let configured = Self::settings(cx)
+            .available_models
+            .iter()
+            .any(|configured| configured.name == model.id().0.as_ref());
+        if configured {
+            return Task::ready(Ok(None));
+        }
+
+        let model_id = model.id().0.to_string();
+        let now = cx.background_executor().now();
+        let fresh = self
+            .state
+            .read(cx)
+            .upstream_providers
+            .get(&model_id)
+            .filter(|cached| now.duration_since(cached.fetched_at) < PROVIDER_ENDPOINTS_TTL)
+            .map(|cached| cached.providers.clone());
+        if let Some(providers) = fresh {
+            return Task::ready(Ok(Some(providers)));
+        }
+
+        let http_client = self.http_client.clone();
+        let api_url = Self::api_url(cx);
+        let extra_headers = Self::settings(cx).custom_headers.clone();
+        let Some(api_key) = self.state.read(cx).api_key_state.key(&api_url) else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "No API key is configured for {}",
+                PROVIDER_NAME.0
+            )));
+        };
+
+        let state = self.state.clone();
+        cx.spawn(async move |cx| {
+            let endpoints = match list_provider_endpoints(
+                http_client.as_ref(),
+                &api_url,
+                &api_key,
+                &model_id,
+                &extra_headers,
+            )
+            .await
+            {
+                Ok(endpoints) => endpoints,
+                Err(error) => {
+                    let error = LanguageModelCompletionError::from(error);
+                    let stale = state.read_with(cx, |state, _cx| {
+                        state
+                            .upstream_providers
+                            .get(&model_id)
+                            .map(|cached| cached.providers.clone())
+                    });
+                    let Some(providers) = stale else {
+                        return Err(error.into());
+                    };
+                    log::warn!(
+                        "Failed to refresh upstream providers for {model_id}, using the cached list: {error:#}"
+                    );
+                    return Ok(Some(providers));
+                }
+            };
+
+            let providers = upstream_providers_from_endpoints(&endpoints);
+            let fetched_at = cx.background_executor().now();
+            state.update(cx, |state, cx| {
+                state.upstream_providers.insert(
+                    model_id,
+                    CachedUpstreamProviders {
+                        providers: providers.clone(),
+                        fetched_at,
+                    },
+                );
+                cx.notify();
+            });
+            Ok(Some(providers))
+        })
+    }
+
+    fn upstream_provider(
+        &self,
+        model: &LanguageModel,
+        provider: &str,
+        cx: &App,
+    ) -> Option<UpstreamProvider> {
+        if Self::settings(cx)
+            .available_models
+            .iter()
+            .any(|configured| configured.name == model.id().0.as_ref())
+        {
+            return None;
+        }
+        let cached = self
+            .state
+            .read(cx)
+            .upstream_providers
+            .get(model.id().0.as_ref())?;
+        cached
+            .providers
+            .iter()
+            .find(|listed| listed.id == provider)
+            .cloned()
+    }
+
     fn is_authenticated(&self, cx: &App) -> bool {
         self.state.read(cx).is_authenticated()
     }
@@ -369,6 +489,65 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
         self.state
             .update(cx, |state, cx| state.set_api_key(api_key, cx))
     }
+}
+
+fn upstream_providers_from_endpoints(endpoints: &[ProviderEndpoint]) -> Vec<UpstreamProvider> {
+    let mut providers: Vec<UpstreamProvider> = endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let id = endpoint.slug.clone()?;
+            let mut tags = Vec::new();
+            // The slug variant stands in for the service tier when the API
+            // reports none.
+            let slug_variant = endpoint
+                .slug
+                .as_deref()
+                .and_then(|slug| slug.split_once('/'))
+                .map(|(_, variant)| variant);
+            if let Some(service_tier) = endpoint.service_tier.as_deref().or(slug_variant) {
+                tags.push(service_tier.to_string());
+            }
+            if let Some(quantization) = endpoint
+                .quantization
+                .as_deref()
+                .filter(|quantization| *quantization != "unknown")
+            {
+                tags.push(quantization.to_string());
+            }
+            tags.dedup();
+            let pricing = endpoint.pricing.as_ref().and_then(|pricing| {
+                let input = pricing.prompt.map(|price| price * 1_000_000.0);
+                let output = pricing.completion.map(|price| price * 1_000_000.0);
+                let cache_read = pricing.input_cache_read.map(|price| price * 1_000_000.0);
+                (input.is_some() || output.is_some() || cache_read.is_some()).then_some(
+                    UpstreamProviderPricing {
+                        input,
+                        output,
+                        cache_read,
+                        discount: pricing.discount,
+                    },
+                )
+            });
+            Some(UpstreamProvider {
+                id,
+                name: endpoint.provider_name.clone(),
+                tags,
+                pricing,
+                throughput: endpoint.throughput_last_30m.as_ref().map(|stats| stats.p50),
+                latency: endpoint.latency_last_30m.as_ref().map(|stats| stats.p50),
+                context_length: endpoint.context_length,
+            })
+        })
+        .collect();
+
+    // Fastest first. Endpoints without throughput data go last.
+    providers.sort_by(|left, right| {
+        right
+            .throughput
+            .partial_cmp(&left.throughput)
+            .unwrap_or(Ordering::Equal)
+    });
+    providers
 }
 
 impl LanguageModelClient for OpenRouterLanguageModelProvider {
@@ -432,7 +611,6 @@ fn language_model(model: &open_router::Model) -> LanguageModel {
         ),
         supports_disabling_thinking: !model.mandatory_reasoning,
         supported_effort_levels,
-        max_output_tokens: model.max_output_tokens(),
         tool_choice_support: LanguageModelToolChoiceSupport::ALL,
         supports_images: model.supports_images.unwrap_or(false),
         ..LanguageModel::new(
@@ -664,7 +842,14 @@ pub fn into_open_router(
             LanguageModelToolChoice::Any => open_router::ToolChoice::Required,
             LanguageModelToolChoice::None => open_router::ToolChoice::None,
         }),
-        provider: model.provider.clone(),
+        provider: request
+            .upstream_provider
+            .map(|upstream_provider| {
+                let mut provider = model.provider.clone().unwrap_or_default();
+                provider.only = Some(vec![upstream_provider]);
+                provider
+            })
+            .or_else(|| model.provider.clone()),
     })
 }
 
@@ -768,6 +953,8 @@ fn add_message_content_part(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::BorrowAppContext;
+    use open_router::{PercentileStats, ProviderPricing};
 
     #[gpui::test]
     async fn test_session_id_is_stable_without_exposing_thread_id() {
@@ -868,6 +1055,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -1012,6 +1200,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -1080,6 +1269,7 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             speed: None,
+            upstream_provider: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -1190,6 +1380,91 @@ mod tests {
         assert_eq!(reasoning.max_tokens, None);
     }
 
+    #[test]
+    fn into_open_router_uses_requested_upstream_provider() {
+        let model = open_router::Model::new(
+            "openai/gpt-4",
+            Some("GPT-4"),
+            Some(8192),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        let request = LanguageModelRequest {
+            upstream_provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+
+        let result = into_open_router(request, &model, None).unwrap();
+        let provider = result.provider.expect("provider should be set");
+        assert_eq!(provider.only, Some(vec!["openai".to_string()]));
+    }
+
+    #[test]
+    fn into_open_router_falls_back_to_model_provider() {
+        let model = open_router::Model::new(
+            "openai/gpt-4",
+            Some("GPT-4"),
+            Some(8192),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            None,
+            false,
+            Some(provider_with_only("azure")),
+        );
+
+        let result = into_open_router(LanguageModelRequest::default(), &model, None).unwrap();
+        let provider = result.provider.expect("provider from model");
+        assert_eq!(provider.only, Some(vec!["azure".to_string()]));
+    }
+
+    #[test]
+    fn into_open_router_merges_upstream_provider_into_model_provider() {
+        let model_provider: open_router::Provider = serde_json::from_value(serde_json::json!({
+            "only": ["anthropic"],
+            "order": ["anthropic"],
+            "allow_fallbacks": false,
+            "sort": "price"
+        }))
+        .unwrap();
+        let model = open_router::Model::new(
+            "openai/gpt-4",
+            Some("GPT-4"),
+            Some(8192),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            None,
+            false,
+            Some(model_provider),
+        );
+        let request = LanguageModelRequest {
+            upstream_provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+
+        let result = into_open_router(request, &model, None).unwrap();
+        let provider = result.provider.expect("provider should be set");
+        let value = serde_json::to_value(&provider).unwrap();
+        assert_eq!(value["only"], serde_json::json!(["openai"]));
+        assert_eq!(value["order"], serde_json::json!(["anthropic"]));
+        assert_eq!(value["allow_fallbacks"], serde_json::json!(false));
+        assert_eq!(value["sort"], serde_json::json!("price"));
+    }
+
+    fn provider_with_only(only: &str) -> open_router::Provider {
+        let mut provider = open_router::Provider::default();
+        provider.only = Some(vec![only.to_string()]);
+        provider
+    }
+
     struct TestCredentialsProvider;
 
     impl CredentialsProvider for TestCredentialsProvider {
@@ -1249,5 +1524,369 @@ mod tests {
             error.is_some(),
             "a failed model fetch should be recorded, not silently dropped"
         );
+    }
+
+    #[test]
+    fn upstream_providers_from_endpoints_uses_slug_and_variant() {
+        let endpoints = vec![
+            ProviderEndpoint {
+                name: "OpenAI: GPT-4".to_string(),
+                provider_name: "OpenAI".to_string(),
+                slug: Some("openai".to_string()),
+                context_length: Some(8192),
+                max_completion_tokens: Some(4096),
+                quantization: Some("fp16".to_string()),
+                service_tier: Some("flex".to_string()),
+                status: Some(0),
+                supported_parameters: vec!["tools".to_string()],
+                pricing: Some(ProviderPricing {
+                    prompt: Some(0.00003),
+                    completion: Some(0.00006),
+                    input_cache_read: Some(0.000015),
+                    discount: Some(0.25),
+                }),
+                throughput_last_30m: Some(PercentileStats {
+                    p50: 68.4,
+                    p75: 55.1,
+                    p90: 41.2,
+                    p99: 22.9,
+                }),
+                latency_last_30m: Some(PercentileStats {
+                    p50: 460.0,
+                    p75: 720.0,
+                    p90: 1100.0,
+                    p99: 2400.0,
+                }),
+            },
+            ProviderEndpoint {
+                name: "DeepInfra (Turbo): GPT-4".to_string(),
+                provider_name: "DeepInfra".to_string(),
+                slug: Some("deepinfra/turbo".to_string()),
+                context_length: Some(16384),
+                max_completion_tokens: Some(8192),
+                quantization: None,
+                service_tier: None,
+                status: Some(0),
+                supported_parameters: Vec::new(),
+                pricing: None,
+                throughput_last_30m: None,
+                latency_last_30m: None,
+            },
+            ProviderEndpoint {
+                name: "No slug".to_string(),
+                provider_name: "Unknown".to_string(),
+                slug: None,
+                context_length: None,
+                max_completion_tokens: None,
+                quantization: None,
+                service_tier: None,
+                status: None,
+                supported_parameters: Vec::new(),
+                pricing: None,
+                throughput_last_30m: None,
+                latency_last_30m: None,
+            },
+            ProviderEndpoint {
+                name: "Together: GPT-4".to_string(),
+                provider_name: "Together".to_string(),
+                slug: Some("together".to_string()),
+                context_length: Some(8192),
+                max_completion_tokens: Some(4096),
+                quantization: Some("unknown".to_string()),
+                service_tier: Some("priority".to_string()),
+                status: Some(0),
+                supported_parameters: Vec::new(),
+                pricing: None,
+                throughput_last_30m: Some(PercentileStats {
+                    p50: 120.0,
+                    p75: 100.0,
+                    p90: 80.0,
+                    p99: 40.0,
+                }),
+                latency_last_30m: None,
+            },
+            ProviderEndpoint {
+                name: "GMICloud: GPT-4".to_string(),
+                provider_name: "GMICloud".to_string(),
+                slug: Some("gmicloud/fp8".to_string()),
+                context_length: Some(32768),
+                max_completion_tokens: None,
+                quantization: Some("fp8".to_string()),
+                service_tier: None,
+                status: Some(0),
+                supported_parameters: Vec::new(),
+                pricing: None,
+                throughput_last_30m: None,
+                latency_last_30m: None,
+            },
+        ];
+
+        let options = upstream_providers_from_endpoints(&endpoints);
+
+        assert_eq!(
+            options,
+            vec![
+                UpstreamProvider {
+                    id: "together".to_string(),
+                    name: "Together".to_string(),
+                    tags: vec!["priority".to_string()],
+                    pricing: None,
+                    throughput: Some(120.0),
+                    latency: None,
+                    context_length: Some(8192),
+                },
+                UpstreamProvider {
+                    id: "openai".to_string(),
+                    name: "OpenAI".to_string(),
+                    tags: vec!["flex".to_string(), "fp16".to_string()],
+                    pricing: Some(UpstreamProviderPricing {
+                        input: Some(30.0),
+                        output: Some(60.0),
+                        cache_read: Some(15.0),
+                        discount: Some(0.25),
+                    }),
+                    throughput: Some(68.4),
+                    latency: Some(460.0),
+                    context_length: Some(8192),
+                },
+                UpstreamProvider {
+                    id: "deepinfra/turbo".to_string(),
+                    name: "DeepInfra".to_string(),
+                    tags: vec!["turbo".to_string()],
+                    pricing: None,
+                    throughput: None,
+                    latency: None,
+                    context_length: Some(16384),
+                },
+                UpstreamProvider {
+                    id: "gmicloud/fp8".to_string(),
+                    name: "GMICloud".to_string(),
+                    tags: vec!["fp8".to_string()],
+                    pricing: None,
+                    throughput: None,
+                    latency: None,
+                    context_length: Some(32768),
+                },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn upstream_provider_reports_endpoint_limits(cx: &mut gpui::TestAppContext) {
+        let provider = provider_with_http(cx, |request| {
+            if request.uri().path().ends_with("/endpoints") {
+                http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(ENDPOINTS_RESPONSE))
+                    .expect("endpoints response")
+            } else {
+                http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(MODELS_RESPONSE))
+                    .expect("models response")
+            }
+        });
+        let model = authenticated_model(&provider, cx).await;
+
+        let unknown = cx.update(|cx| provider.upstream_provider(&model, "openai", cx));
+        assert_eq!(
+            unknown, None,
+            "limits are unknown before the list is fetched"
+        );
+
+        let listed = cx
+            .update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers")
+            .expect("providers are listed")
+            .into_iter()
+            .find(|provider| provider.id == "openai")
+            .expect("openai is listed");
+        let single = cx
+            .update(|cx| provider.upstream_provider(&model, "openai", cx))
+            .expect("the provider is known after the list is fetched");
+
+        assert_eq!(single, listed);
+        assert_eq!(single.context_length, Some(8192));
+    }
+
+    #[gpui::test]
+    async fn upstream_providers_are_none_for_configured_models(cx: &mut gpui::TestAppContext) {
+        let provider = cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+
+            let content = serde_json::json!({
+                "language_models": {
+                    "open_router": {
+                        "available_models": [{
+                            "name": "openai/gpt-4",
+                            "max_tokens": 8192,
+                            "provider": {
+                                "only": ["openai"]
+                            }
+                        }]
+                    }
+                }
+            })
+            .to_string();
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(&content, cx)
+                    .expect("failed to parse test settings");
+            });
+
+            let http_client = http_client::FakeHttpClient::create(|_request| async move {
+                unreachable!("upstream providers must not be fetched when only is configured")
+            });
+            OpenRouterLanguageModelProvider::new(http_client, Arc::new(TestCredentialsProvider), cx)
+        });
+
+        let model = cx.update(|cx| {
+            provider
+                .provided_models(cx)
+                .into_iter()
+                .find(|model| model.id().0.as_ref() == "openai/gpt-4")
+                .expect("model from settings")
+        });
+
+        let options = cx
+            .update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers");
+
+        assert!(options.is_none());
+    }
+
+    const MODELS_RESPONSE: &str = r#"{
+        "data": [
+            {
+                "id": "openai/gpt-4",
+                "name": "OpenAI: GPT-4",
+                "created": 0,
+                "description": "",
+                "context_length": 8192,
+                "supported_parameters": ["tools"]
+            }
+        ]
+    }"#;
+
+    const ENDPOINTS_RESPONSE: &str = r#"{
+        "data": {
+            "id": "openai/gpt-4",
+            "name": "GPT-4",
+            "endpoints": [
+                {
+                    "name": "OpenAI: GPT-4",
+                    "provider_name": "OpenAI",
+                    "tag": "openai",
+                    "context_length": 8192,
+                    "status": 0,
+                    "supported_parameters": ["tools"]
+                }
+            ]
+        }
+    }"#;
+
+    /// Builds a provider whose HTTP client answers model and endpoint requests
+    /// through `handler`.
+    fn provider_with_http(
+        cx: &mut gpui::TestAppContext,
+        handler: impl Fn(
+            http_client::Request<http_client::AsyncBody>,
+        ) -> http_client::Response<http_client::AsyncBody>
+        + Send
+        + Sync
+        + 'static,
+    ) -> OpenRouterLanguageModelProvider {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            let http_client = http_client::FakeHttpClient::create(move |request| {
+                let response = handler(request);
+                async move { Ok(response) }
+            });
+            OpenRouterLanguageModelProvider::new(http_client, Arc::new(TestCredentialsProvider), cx)
+        })
+    }
+
+    async fn authenticated_model(
+        provider: &OpenRouterLanguageModelProvider,
+        cx: &mut gpui::TestAppContext,
+    ) -> LanguageModel {
+        cx.update(|cx| provider.set_api_key(Some("test-key".to_string()), cx))
+            .await
+            .expect("api key");
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            provider
+                .provided_models(cx)
+                .into_iter()
+                .find(|model| model.id().0.as_ref() == "openai/gpt-4")
+                .expect("model from the fetched list")
+        })
+    }
+
+    #[gpui::test]
+    async fn upstream_providers_are_cached_for_an_hour(cx: &mut gpui::TestAppContext) {
+        let endpoint_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fail_endpoints = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let counter = endpoint_requests.clone();
+        let failing = fail_endpoints.clone();
+        let provider = provider_with_http(cx, move |request| {
+            if !request.uri().path().ends_with("/endpoints") {
+                return http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(MODELS_RESPONSE))
+                    .expect("models response");
+            }
+
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return http_client::Response::builder()
+                    .status(500)
+                    .body(http_client::AsyncBody::from(
+                        r#"{"error":{"code":500,"message":"boom"}}"#,
+                    ))
+                    .expect("error response");
+            }
+            http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::from(ENDPOINTS_RESPONSE))
+                .expect("endpoints response")
+        });
+
+        let model = authenticated_model(&provider, cx).await;
+        let requests = || endpoint_requests.load(std::sync::atomic::Ordering::SeqCst);
+
+        let first = cx
+            .update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers")
+            .expect("providers are listed");
+        assert_eq!(requests(), 1);
+
+        cx.update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers");
+        assert_eq!(requests(), 1, "a read inside the TTL uses the cache");
+
+        cx.executor()
+            .advance_clock(PROVIDER_ENDPOINTS_TTL + Duration::from_secs(1));
+        cx.update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("upstream providers");
+        assert_eq!(requests(), 2, "a read after the TTL fetches again");
+
+        cx.executor()
+            .advance_clock(PROVIDER_ENDPOINTS_TTL + Duration::from_secs(1));
+        fail_endpoints.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stale = cx
+            .update(|cx| provider.upstream_providers(&model, cx))
+            .await
+            .expect("a failed refresh must not hide the cached list")
+            .expect("providers are still listed");
+        assert_eq!(stale, first);
     }
 }
