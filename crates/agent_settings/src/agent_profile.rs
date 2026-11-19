@@ -62,6 +62,10 @@ impl AgentProfile {
             .as_ref()
             .map(|profile| profile.enable_all_context_servers)
             .unwrap_or_default();
+        let defer_context_server_tools = base_profile
+            .as_ref()
+            .map(|profile| profile.defer_context_server_tools)
+            .unwrap_or_default();
         let context_servers = base_profile
             .as_ref()
             .map(|profile| profile.context_servers.clone())
@@ -75,6 +79,7 @@ impl AgentProfile {
             name: name.into(),
             tools,
             enable_all_context_servers,
+            defer_context_server_tools,
             context_servers,
             default_model,
         };
@@ -106,6 +111,7 @@ pub struct AgentProfileSettings {
     pub name: SharedString,
     pub tools: IndexMap<Arc<str>, bool>,
     pub enable_all_context_servers: bool,
+    pub defer_context_server_tools: bool,
     pub context_servers: IndexMap<Arc<str>, ContextServerPreset>,
     /// Default language model to apply when this profile becomes active.
     pub default_model: Option<LanguageModelSelection>,
@@ -149,6 +155,13 @@ impl AgentProfileSettings {
             .unwrap_or(self.enable_all_context_servers)
     }
 
+    pub fn is_context_server_deferred(&self, server_id: &str) -> bool {
+        self.context_servers
+            .get(server_id)
+            .and_then(|preset| preset.defer)
+            .unwrap_or(self.defer_context_server_tools)
+    }
+
     pub fn save_to_settings(
         &self,
         profile_id: AgentProfileId,
@@ -169,6 +182,7 @@ impl AgentProfileSettings {
                 name: self.name.clone().into(),
                 tools: self.tools.clone(),
                 enable_all_context_servers: Some(self.enable_all_context_servers),
+                defer_context_server_tools: Some(self.defer_context_server_tools),
                 context_servers: self
                     .context_servers
                     .clone()
@@ -178,6 +192,7 @@ impl AgentProfileSettings {
                             server_id,
                             ContextServerPresetContent {
                                 tools: preset.tools,
+                                defer: preset.defer,
                             },
                         )
                     })
@@ -196,6 +211,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             name,
             tools,
             enable_all_context_servers,
+            defer_context_server_tools,
             context_servers,
             default_model,
         } = content;
@@ -204,6 +220,7 @@ impl From<AgentProfileContent> for AgentProfileSettings {
             name: name.into(),
             tools,
             enable_all_context_servers: enable_all_context_servers.unwrap_or_default(),
+            defer_context_server_tools: defer_context_server_tools.unwrap_or_default(),
             context_servers: context_servers
                 .into_iter()
                 .map(|(server_id, preset)| (server_id, preset.into()))
@@ -216,12 +233,14 @@ impl From<AgentProfileContent> for AgentProfileSettings {
 #[derive(Debug, Clone, Default)]
 pub struct ContextServerPreset {
     pub tools: IndexMap<Arc<str>, bool>,
+    pub defer: Option<bool>,
 }
 
 impl From<settings::ContextServerPresetContent> for ContextServerPreset {
     fn from(content: settings::ContextServerPresetContent) -> Self {
         Self {
             tools: content.tools,
+            defer: content.defer,
         }
     }
 }
@@ -238,6 +257,7 @@ mod tests {
             name: "test".into(),
             tools: IndexMap::default(),
             enable_all_context_servers,
+            defer_context_server_tools: false,
             context_servers,
             default_model: None,
         }
@@ -249,6 +269,7 @@ mod tests {
                 .iter()
                 .map(|(name, enabled)| (Arc::from(*name), *enabled))
                 .collect(),
+            defer: None,
         }
     }
 

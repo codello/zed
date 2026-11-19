@@ -611,6 +611,9 @@ pub struct AgentProfileContent {
     pub tools: IndexMap<Arc<str>, bool>,
     /// Whether all context servers are enabled by default.
     pub enable_all_context_servers: Option<bool>,
+    /// Whether the agent loads the descriptions and input schemas of context
+    /// server tools only on request. This decreases the size of each request.
+    pub defer_context_server_tools: Option<bool>,
     #[serde(default)]
     pub context_servers: IndexMap<Arc<str>, ContextServerPresetContent>,
     /// The default language model selected when using this profile.
@@ -621,6 +624,9 @@ pub struct AgentProfileContent {
 #[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct ContextServerPresetContent {
     pub tools: IndexMap<Arc<str>, bool>,
+    /// Whether the agent loads the tools of this context server only on
+    /// request. Overrides `defer_context_server_tools` of the profile.
+    pub defer: Option<bool>,
 }
 
 fn agent_profile_tools_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {

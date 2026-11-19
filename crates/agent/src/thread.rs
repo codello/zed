@@ -1677,11 +1677,15 @@ impl Thread {
             self.context_server_registry
                 .read(cx)
                 .servers()
-                .find_map(|(_, tools)| {
+                .find_map(|(server_id, tools)| {
                     if let Some(tool) = tools.get(tool_use.name.as_ref()) {
                         Some(tool.clone())
                     } else {
-                        None
+                        tools.iter().find_map(|(tool_name, tool)| {
+                            (crate::context_server_tool_name(&server_id.0, tool_name)
+                                == tool_use.name.as_ref())
+                            .then(|| tool.clone())
+                        })
                     }
                 })
         });
@@ -4463,11 +4467,16 @@ impl Thread {
             for (tool_name, tool) in server_tools {
                 if profile.is_context_server_tool_enabled(&server_id.0, &tool_name) {
                     let tool_name: SharedString =
-                        provider_compatible_tool_name(tool_name.as_ref()).into();
+                        crate::context_server_tool_name(&server_id.0, &tool_name).into();
                     if !seen_tools.insert(tool_name.clone()) {
                         duplicate_tool_names.insert(tool_name.clone());
                     }
-                    context_server_tools.push((server_id.clone(), tool_name, tool.clone()));
+                    let tool = if profile.is_context_server_deferred(&server_id.0) {
+                        crate::DeferredTool::wrap(tool.clone())
+                    } else {
+                        tool.clone()
+                    };
+                    context_server_tools.push((server_id.clone(), tool_name, tool));
                 }
             }
         }
@@ -4494,6 +4503,7 @@ impl Thread {
             }
         }
 
+        crate::ToolSearchTool::add_if_needed(&mut tools);
         tools
     }
 
@@ -5616,6 +5626,10 @@ pub trait AnyAgentTool {
     }
     fn allow_in_restricted_mode(&self) -> bool {
         true
+    }
+    /// The tool with the full definition, if the model sees only a placeholder for this tool.
+    fn deferred_tool(&self) -> Option<&Arc<dyn AnyAgentTool>> {
+        None
     }
     /// See [`AgentTool::run`] for why this returns `Result<AgentToolOutput, AgentToolOutput>`.
     fn run(

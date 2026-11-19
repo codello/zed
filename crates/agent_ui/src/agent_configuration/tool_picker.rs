@@ -299,6 +299,9 @@ impl PickerDelegate for ToolPickerDelegate {
                         enable_all_context_servers: Some(
                             default_profile.enable_all_context_servers,
                         ),
+                        defer_context_server_tools: Some(
+                            default_profile.defer_context_server_tools,
+                        ),
                         context_servers: default_profile
                             .context_servers
                             .into_iter()
@@ -307,6 +310,7 @@ impl PickerDelegate for ToolPickerDelegate {
                                     server_id,
                                     ContextServerPresetContent {
                                         tools: preset.tools,
+                                        defer: preset.defer,
                                     },
                                 )
                             })

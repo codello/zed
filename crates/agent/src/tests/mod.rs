@@ -1868,12 +1868,15 @@ async fn test_mcp_tools(cx: &mut TestAppContext) {
 
     // Simulate the model calling the MCP tool.
     let completion = fake.pending_completions().pop().unwrap();
-    assert_eq!(tool_names_for_completion(&completion), vec!["echo"]);
+    assert_eq!(
+        tool_names_for_completion(&completion),
+        vec!["test_server__echo"]
+    );
     fake.send_last_event(
         &model,
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_1".into(),
-            name: "echo".into(),
+            name: "test_server__echo".into(),
             raw_input: json!({"text": "test"}).to_string(),
             input: language_model::LanguageModelToolUseInput::Json(json!({"text": "test"})),
             is_input_complete: true,
@@ -1898,12 +1901,15 @@ async fn test_mcp_tools(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
 
-    assert_eq!(tool_names_for_completion(&completion), vec!["echo"]);
+    assert_eq!(
+        tool_names_for_completion(&completion),
+        vec!["test_server__echo"]
+    );
     fake.send_last_text(&model, "Done!");
     fake.end_last(&model);
     events.collect::<Vec<_>>().await;
 
-    // Send again after adding the echo tool, ensuring the name collision is resolved.
+    // Send again after adding the echo tool. The server prefix prevents a name collision.
     let events = thread.update(cx, |thread, cx| {
         thread.add_tool(EchoTool);
         thread.send(ClientUserMessageId::new(), ["Go"], cx).unwrap()
@@ -1912,13 +1918,13 @@ async fn test_mcp_tools(cx: &mut TestAppContext) {
     let completion = fake.pending_completions().pop().unwrap();
     assert_eq!(
         tool_names_for_completion(&completion),
-        vec!["echo", "test_server_echo"]
+        vec!["echo", "test_server__echo"]
     );
     fake.send_last_event(
         &model,
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_2".into(),
-            name: "test_server_echo".into(),
+            name: "test_server__echo".into(),
             raw_input: json!({"text": "mcp"}).to_string(),
             input: language_model::LanguageModelToolUseInput::Json(json!({"text": "mcp"})),
             is_input_complete: true,
@@ -1966,13 +1972,188 @@ async fn test_mcp_tools(cx: &mut TestAppContext) {
             },),
             MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tool_2".into(),
-                tool_name: "test_server_echo".into(),
+                tool_name: "test_server__echo".into(),
                 is_error: false,
                 content: vec!["mcp".into()],
                 output: Some("mcp".into()),
             },),
         ]
     );
+    fake.end_last(&model);
+    events.collect::<Vec<_>>().await;
+}
+
+#[gpui::test]
+async fn test_deferred_mcp_tools(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        context_server_store,
+        fs,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "tool_permissions": { "default": "allow" },
+                "profiles": {
+                    "test": {
+                        "name": "Test Profile",
+                        "enable_all_context_servers": true,
+                        "defer_context_server_tools": true,
+                        "context_servers": {
+                            "eager_server": { "tools": {}, "defer": false }
+                        }
+                    },
+                }
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+    thread.update(cx, |thread, cx| {
+        thread.set_profile(AgentProfileId("test".into()), cx)
+    });
+
+    let mut deferred_tool_calls = setup_context_server(
+        "deferred_server",
+        vec![context_server::types::Tool {
+            name: "lookup".into(),
+            title: None,
+            description: Some("Looks up a value.".into()),
+            input_schema: EchoTool::input_schema().to_value(),
+            output_schema: None,
+            annotations: None,
+        }],
+        &context_server_store,
+        cx,
+    );
+    let _eager_tool_calls = setup_context_server(
+        "eager_server",
+        vec![context_server::types::Tool {
+            name: "ping".into(),
+            title: None,
+            description: Some("Sends a ping.".into()),
+            input_schema: EchoTool::input_schema().to_value(),
+            output_schema: None,
+            annotations: None,
+        }],
+        &context_server_store,
+        cx,
+    );
+
+    let events = thread.update(cx, |thread, cx| {
+        thread
+            .send(ClientUserMessageId::new(), ["Hey"], cx)
+            .unwrap()
+    });
+    cx.run_until_parked();
+
+    let completion = fake.pending_completions().pop().unwrap();
+    let initial_tools = completion.tools.clone();
+    assert_eq!(
+        tool_names_for_completion(&completion),
+        vec![
+            "deferred_server__lookup",
+            "eager_server__ping",
+            ToolSearchTool::NAME
+        ]
+    );
+    let lookup = initial_tools
+        .iter()
+        .find(|tool| tool.name == "deferred_server__lookup")
+        .unwrap();
+    assert_eq!(lookup.description, "Looks up a value. (deferred)");
+    let language_model::LanguageModelRequestToolInput::Function { input_schema, .. } =
+        &lookup.input
+    else {
+        panic!("deferred tool should use a JSON schema");
+    };
+    assert_eq!(
+        input_schema,
+        &json!({ "type": "object", "properties": {}, "additionalProperties": true })
+    );
+    let ping = initial_tools
+        .iter()
+        .find(|tool| tool.name == "eager_server__ping")
+        .unwrap();
+    assert_eq!(ping.description, "Sends a ping.");
+
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "tool_1".into(),
+            name: ToolSearchTool::NAME.into(),
+            raw_input: json!({"names": ["deferred_server__lookup", "missing"]}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(
+                json!({"names": ["deferred_server__lookup", "missing"]}),
+            ),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    // The tool definitions stay the same, so the cached request prefix stays valid.
+    let completion = fake.pending_completions().pop().unwrap();
+    assert_eq!(completion.tools, initial_tools);
+    let Some(MessageContent::ToolResult(result)) =
+        completion.messages.last().unwrap().content.last()
+    else {
+        panic!("expected a tool result");
+    };
+    assert!(!result.is_error);
+    let [language_model::LanguageModelToolResultContent::Text(text)] = result.content.as_slice()
+    else {
+        panic!("expected a single text result");
+    };
+    assert!(
+        text.contains("\"name\":\"deferred_server__lookup\""),
+        "{text}"
+    );
+    assert!(text.contains("Looks up a value."), "{text}");
+    assert!(text.contains("\"text\""), "{text}");
+    assert!(text.contains("missing"), "{text}");
+
+    // The model calls the deferred tool with its real name.
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "tool_2".into(),
+            name: "deferred_server__lookup".into(),
+            raw_input: json!({"text": "value"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"text": "value"})),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let (tool_call_params, tool_call_response) = deferred_tool_calls.next().await.unwrap();
+    assert_eq!(tool_call_params.name, "lookup");
+    assert_eq!(tool_call_params.arguments, Some(json!({"text": "value"})));
+    tool_call_response
+        .send(context_server::types::CallToolResponse {
+            content: vec![context_server::types::ToolResponseContent::Text {
+                text: "found".into(),
+            }],
+            is_error: None,
+            meta: None,
+            structured_content: None,
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let completion = fake.pending_completions().pop().unwrap();
+    assert_eq!(completion.tools, initial_tools);
+    fake.send_last_text(&model, "Done!");
     fake.end_last(&model);
     events.collect::<Vec<_>>().await;
 }
@@ -2034,13 +2215,13 @@ async fn test_mcp_tool_names_are_sanitized_for_providers(cx: &mut TestAppContext
     let completion = fake.pending_completions().pop().unwrap();
     assert_eq!(
         tool_names_for_completion(&completion),
-        vec!["snake_case_PascalCase"]
+        vec!["superluminal__snake_case_PascalCase"]
     );
     fake.send_last_event(
         &model,
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_1".into(),
-            name: "snake_case_PascalCase".into(),
+            name: "superluminal__snake_case_PascalCase".into(),
             raw_input: json!({}).to_string(),
             input: language_model::LanguageModelToolUseInput::Json(json!({})),
             is_input_complete: true,
@@ -2133,7 +2314,7 @@ async fn test_mcp_tool_multi_content_response(cx: &mut TestAppContext) {
         &model,
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_1".into(),
-            name: "screenshot".into(),
+            name: "screenshot_server__screenshot".into(),
             raw_input: json!({}).to_string(),
             input: language_model::LanguageModelToolUseInput::Json(json!({})),
             is_input_complete: true,
@@ -2274,7 +2455,7 @@ async fn test_mcp_tool_result_displayed_when_server_disconnected(cx: &mut TestAp
     let completion = fake.pending_completions().pop().unwrap();
     assert_eq!(
         tool_names_for_completion(&completion),
-        vec!["issue_read"],
+        vec!["github_server__issue_read"],
         "MCP tool should be available"
     );
 
@@ -2283,7 +2464,7 @@ async fn test_mcp_tool_result_displayed_when_server_disconnected(cx: &mut TestAp
         &model,
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_1".into(),
-            name: "issue_read".into(),
+            name: "github_server__issue_read".into(),
             raw_input: json!({"issue_url": "https://github.com/zed-industries/zed/issues/47404"})
                 .to_string(),
             input: language_model::LanguageModelToolUseInput::Json(
@@ -2329,7 +2510,7 @@ async fn test_mcp_tool_result_displayed_when_server_disconnected(cx: &mut TestAp
     thread.update(cx, |thread, _cx| {
         let markdown = thread.to_markdown();
         assert!(
-            markdown.contains("**Tool Result**: issue_read"),
+            markdown.contains("**Tool Result**: github_server__issue_read"),
             "Thread should contain tool result header"
         );
         assert!(
@@ -2451,7 +2632,7 @@ async fn test_mcp_tool_truncation(cx: &mut TestAppContext) {
         "xxx",
         vec![
             context_server::types::Tool {
-                name: "echo".into(), // Conflicts with native EchoTool
+                name: "echo".into(),
                 title: None,
                 description: None,
                 input_schema: EchoTool::input_schema().to_value(),
@@ -2475,7 +2656,7 @@ async fn test_mcp_tool_truncation(cx: &mut TestAppContext) {
         "yyy",
         vec![
             context_server::types::Tool {
-                name: "echo".into(), // Also conflicts with native EchoTool
+                name: "echo".into(),
                 title: None,
                 description: None,
                 input_schema: EchoTool::input_schema().to_value(),
@@ -2546,7 +2727,7 @@ async fn test_mcp_tool_truncation(cx: &mut TestAppContext) {
     let _server4_calls = setup_context_server(
         "Azure DevOps",
         vec![context_server::types::Tool {
-            name: "echo".into(), // Also conflicts - will be disambiguated as azure_dev_ops_echo
+            name: "echo".into(),
             title: None,
             description: None,
             input_schema: EchoTool::input_schema().to_value(),
@@ -2567,19 +2748,19 @@ async fn test_mcp_tool_truncation(cx: &mut TestAppContext) {
     assert_eq!(
         tool_names_for_completion(&completion),
         vec![
-            "azure_dev_ops_echo",
+            "azure_dev_ops__echo",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "delay",
             "echo",
             "infinite",
             "tool_requiring_permission",
-            "unique_tool_1",
-            "unique_tool_2",
             "word_list",
-            "xxx_echo",
+            "xxx__echo",
+            "xxx__unique_tool_1",
             "y_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "yyy_echo",
+            "yyy__echo",
+            "yyy__unique_tool_2",
             "z_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ]
     );
