@@ -48,6 +48,10 @@ impl FeatureFlag for CreateThreadToolFeatureFlag {
     const NAME: &'static str = "create-thread-tool";
     type Value = PresenceFlag;
 
+    fn enabled_for_all() -> bool {
+        true
+    }
+
     fn enabled_for_staff() -> bool {
         true
     }
