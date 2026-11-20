@@ -1142,9 +1142,9 @@ impl PickerDelegate for WorktreePickerDelegate {
             worktree.directory_name(self.worktree_name_anchor(), self.path_style)
                 == normalized_query
         });
-        let create_named_disabled_reason: Option<String> = if self.has_multiple_repositories {
-            Some("Cannot create a named worktree in a project with multiple repositories".into())
-        } else if has_named_worktree {
+        let create_named_disabled_reason: Option<String> = if has_named_worktree
+            && !self.has_multiple_repositories
+        {
             Some("A worktree with this name already exists".into())
         } else {
             None

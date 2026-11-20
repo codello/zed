@@ -460,6 +460,9 @@ async fn fetch_remote_for_worktree_base(
 /// so we create the new worktree only once and remap every contributing
 /// work directory onto it. Without this dedup, the second `git worktree add`
 /// fails with "already exists".
+///
+/// When the target path of a repository is already a git worktree, that
+/// worktree is used and no new worktree is created for that repository.
 fn start_worktree_creations(
     git_repos: &[Entity<Repository>],
     worktree_name: Option<String>,
@@ -491,14 +494,13 @@ fn start_worktree_creations(
         let (work_dir, new_path, receiver) = repo.update(cx, |repo, _cx| {
             let new_path =
                 repo.path_for_new_linked_worktree(&worktree_name, worktree_directory_setting)?;
-            if existing_worktree_paths.contains(&new_path) {
-                anyhow::bail!("A worktree already exists at {}", new_path.display());
-            }
             let work_dir = repo.work_directory_abs_path.clone();
             // Only the first repo that resolves to a given target path
             // actually creates the worktree; subsequent linked worktrees of
             // the same repository just contribute a path remapping.
-            let receiver = if scheduled_paths.contains(&new_path) {
+            let receiver = if scheduled_paths.contains(&new_path)
+                || existing_worktree_paths.contains(&new_path)
+            {
                 None
             } else {
                 let target = git::repository::CreateWorktreeTarget::Detached {
@@ -1065,7 +1067,7 @@ async fn do_create_worktree(
         .map(|(repo, path, _)| (repo.clone(), path.clone()))
         .collect();
 
-    let created_paths = await_and_rollback_on_failure(creation_infos, fs, cx).await?;
+    await_and_rollback_on_failure(creation_infos, fs, cx).await?;
 
     // Record each created worktree so thread archival can later verify that
     // Zed created it before deleting it from disk. Failures are non-fatal:
@@ -1080,13 +1082,20 @@ async fn do_create_worktree(
         .await;
     }
 
-    // `path_remapping` has one entry per source git repo, while `created_paths`
+    let mut target_paths: Vec<PathBuf> = Vec::new();
+    for (_, new_path) in &path_remapping {
+        if !target_paths.contains(new_path) {
+            target_paths.push(new_path.clone());
+        }
+    }
+
+    // `path_remapping` has one entry per source git repo, while `target_paths`
     // has one per *unique* target worktree. When the former is larger, two or
     // more source repos were linked worktrees of the same underlying
     // repository and `start_worktree_creations` consolidated them.
-    let consolidated_worktrees = path_remapping.len() > created_paths.len();
+    let consolidated_worktrees = path_remapping.len() > target_paths.len();
 
-    let mut all_paths = created_paths;
+    let mut all_paths = target_paths;
     let has_non_git = !non_git_paths.is_empty();
     all_paths.extend(non_git_paths.iter().cloned());
 
@@ -1606,6 +1615,85 @@ mod tests {
                 .as_slice(),
             ["setup worktree"],
             "switching back to the main worktree should not rerun create_worktree hooks"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_create_named_worktree_reuses_existing_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            "/root",
+            json!({
+                "a": { ".git": {}, "a.rs": "" },
+                "b": { ".git": {}, "b.rs": "" },
+            }),
+        )
+        .await;
+        let existing_worktree_path = PathBuf::from(path!("/root/worktrees/b/feature"));
+        fs.add_linked_worktree_for_repo(
+            Path::new(path!("/root/b/.git")),
+            false,
+            git::repository::Worktree {
+                path: existing_worktree_path.clone(),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [Path::new(path!("/root/a")), Path::new(path!("/root/b"))],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let main_workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        main_workspace.update_in(cx, |workspace, window, cx| {
+            handle_create_worktree(
+                workspace,
+                &zed_actions::CreateWorktree {
+                    worktree_name: Some("feature".to_string()),
+                    branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                },
+                window,
+                None,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let new_workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        assert_ne!(new_workspace, main_workspace);
+        let root_paths = new_workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .root_paths(cx)
+                .into_iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            root_paths,
+            [
+                PathBuf::from(path!("/root/worktrees/a/feature")),
+                existing_worktree_path,
+            ]
         );
     }
 
