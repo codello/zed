@@ -940,10 +940,12 @@ pub fn handle_switch_worktree(
     workspace.set_active_worktree_creation(Some(display_name), true, cx);
 
     let worktree_path = action.path.clone();
+    let all_paths = switch_worktree_paths(project.read(cx), &worktree_path, cx);
 
     cx.spawn_in(window, async move |_workspace_entity, mut cx| {
         let result = do_switch_worktree(
             worktree_path,
+            all_paths,
             git_repo_work_dirs,
             non_git_paths,
             previous_state,
@@ -1120,17 +1122,51 @@ async fn do_create_worktree(
     })
 }
 
+/// Returns the root paths of the workspace that a switch to `worktree_path`
+/// opens. In a project with multiple repositories, only the roots of the
+/// active repository change.
 pub(crate) fn switch_worktree_paths(
+    project: &Project,
     worktree_path: &Path,
-    non_git_paths: &[PathBuf],
+    cx: &gpui::App,
 ) -> Vec<PathBuf> {
-    let mut all_paths = vec![worktree_path.to_path_buf()];
-    all_paths.extend(non_git_paths.iter().cloned());
+    let (git_repos, non_git_paths) = classify_worktrees(project, cx);
+    let switched_work_dir = project
+        .active_repository(cx)
+        .filter(|active_repo| git_repos.len() > 1 && git_repos.contains(active_repo))
+        .map(|active_repo| active_repo.read(cx).work_directory_abs_path.clone());
+    let Some(switched_work_dir) = switched_work_dir else {
+        let mut all_paths = vec![worktree_path.to_path_buf()];
+        all_paths.extend(non_git_paths);
+        return all_paths;
+    };
+
+    let work_dirs: Vec<Arc<Path>> = git_repos
+        .iter()
+        .map(|repo| repo.read(cx).work_directory_abs_path.clone())
+        .collect();
+    let mut all_paths: Vec<PathBuf> = Vec::new();
+    for worktree in project.visible_worktrees(cx) {
+        let root_path = worktree.read(cx).abs_path();
+        let owning_work_dir = work_dirs
+            .iter()
+            .filter(|work_dir| root_path.starts_with(work_dir))
+            .max_by_key(|work_dir| work_dir.components().count());
+        let path = if owning_work_dir == Some(&switched_work_dir) {
+            worktree_path.to_path_buf()
+        } else {
+            root_path.to_path_buf()
+        };
+        if !all_paths.contains(&path) {
+            all_paths.push(path);
+        }
+    }
     all_paths
 }
 
 async fn do_switch_worktree(
     worktree_path: PathBuf,
+    all_paths: Vec<PathBuf>,
     git_repo_work_dirs: Vec<PathBuf>,
     non_git_paths: Vec<PathBuf>,
     previous_state: PreviousWorkspaceState,
@@ -1144,7 +1180,6 @@ async fn do_switch_worktree(
         .map(|work_dir| (work_dir.clone(), worktree_path.clone()))
         .collect();
 
-    let all_paths = switch_worktree_paths(&worktree_path, &non_git_paths);
     let has_non_git = !non_git_paths.is_empty();
 
     open_worktree_workspace(
@@ -1693,6 +1728,104 @@ mod tests {
             [
                 PathBuf::from(path!("/root/worktrees/a/feature")),
                 existing_worktree_path,
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_switch_worktree_keeps_other_repositories(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            "/root",
+            json!({
+                "a": { ".git": {}, "a.rs": "" },
+                "b": { ".git": {}, "b.rs": "" },
+                "notes": { "todo.md": "" },
+            }),
+        )
+        .await;
+        let feature_path = PathBuf::from(path!("/root/worktrees/a/feature"));
+        fs.add_linked_worktree_for_repo(
+            Path::new(path!("/root/a/.git")),
+            false,
+            git::repository::Worktree {
+                path: feature_path.clone(),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                Path::new(path!("/root/a")),
+                Path::new(path!("/root/b")),
+                Path::new(path!("/root/notes")),
+            ],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        project.update(cx, |project, cx| {
+            let worktree_a_id = project
+                .visible_worktrees(cx)
+                .find(|worktree| {
+                    worktree.read(cx).abs_path().as_ref() == Path::new(path!("/root/a"))
+                })
+                .map(|worktree| worktree.read(cx).id())
+                .expect("worktree for repository a should exist");
+            project.git_store().update(cx, |git_store, cx| {
+                git_store.set_active_repo_for_worktree(worktree_a_id, cx);
+            });
+        });
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let main_workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        main_workspace.update_in(cx, |workspace, window, cx| {
+            handle_switch_worktree(
+                workspace,
+                &zed_actions::SwitchWorktree {
+                    path: feature_path.clone(),
+                    display_name: "feature".to_string(),
+                },
+                window,
+                None,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let new_workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        assert_ne!(new_workspace, main_workspace);
+        let mut root_paths = new_workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .root_paths(cx)
+                .into_iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        root_paths.sort();
+        assert_eq!(
+            root_paths,
+            [
+                PathBuf::from(path!("/root/b")),
+                PathBuf::from(path!("/root/notes")),
+                feature_path,
             ]
         );
     }

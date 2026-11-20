@@ -610,7 +610,6 @@ impl WorktreePickerDelegate {
         if group_workspaces.is_empty() {
             return Vec::new();
         }
-        let (_, non_git_paths) = classify_worktrees(self.project.read(cx), cx);
         let host = self.project.read(cx).remote_connection_options(cx).cloned();
         let switch_targets = self
             .all_worktrees
@@ -618,7 +617,11 @@ impl WorktreePickerDelegate {
             .filter(|git_worktree| !self.active_worktree_paths.contains(&git_worktree.path))
             .filter_map(|git_worktree| {
                 multi_workspace.workspace_for_paths(
-                    &PathList::new(&switch_worktree_paths(&git_worktree.path, &non_git_paths)),
+                    &PathList::new(&switch_worktree_paths(
+                        self.project.read(cx),
+                        &git_worktree.path,
+                        cx,
+                    )),
                     host.as_ref(),
                     cx,
                 )
@@ -1142,13 +1145,12 @@ impl PickerDelegate for WorktreePickerDelegate {
             worktree.directory_name(self.worktree_name_anchor(), self.path_style)
                 == normalized_query
         });
-        let create_named_disabled_reason: Option<String> = if has_named_worktree
-            && !self.has_multiple_repositories
-        {
-            Some("A worktree with this name already exists".into())
-        } else {
-            None
-        };
+        let create_named_disabled_reason: Option<String> =
+            if has_named_worktree && !self.has_multiple_repositories {
+                Some("A worktree with this name already exists".into())
+            } else {
+                None
+            };
 
         let show_default_branch_create =
             !self.has_multiple_repositories && self.default_branch.is_some();
