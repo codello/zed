@@ -1303,6 +1303,8 @@ pub struct Thread {
     prompt_id: PromptId,
     updated_at: DateTime<Utc>,
     title: Option<SharedString>,
+    /// The title does not agree with the first user message, because that message was removed.
+    title_outdated: bool,
     pending_title_generation: Option<Task<()>>,
     title_generation_error: Option<SharedString>,
     pending_summary_generation: Option<Shared<Task<Option<SharedString>>>>,
@@ -1466,6 +1468,7 @@ impl Thread {
             prompt_id: PromptId::new(),
             updated_at: Utc::now(),
             title: None,
+            title_outdated: false,
             pending_title_generation: None,
             title_generation_error: None,
             pending_summary_generation: None,
@@ -1845,6 +1848,7 @@ impl Thread {
             } else {
                 Some(db_thread.title.clone())
             },
+            title_outdated: false,
             pending_title_generation: None,
             title_generation_error: None,
             pending_summary_generation: None,
@@ -2509,6 +2513,16 @@ impl Thread {
 
         self.remove_messages_from(position);
         self.clear_summary();
+        if self.title.is_some()
+            && !self
+                .messages
+                .iter()
+                .any(|message| matches!(&**message, Message::User(_)))
+        {
+            self.title_outdated = true;
+            // A pending generation uses the removed messages.
+            self.pending_title_generation = None;
+        }
         cx.notify();
         Ok(())
     }
@@ -3289,7 +3303,7 @@ impl Thread {
             this.update(cx, |this, cx| {
                 if &this.prompt_id == prompt_id {
                     this.flush_pending_message(cx);
-                    if this.title.is_none()
+                    if (this.title.is_none() || this.title_outdated)
                         && AgentSettings::get_global(cx).auto_generate_thread_titles
                     {
                         this.generate_title(cx);
@@ -4279,6 +4293,7 @@ impl Thread {
     pub fn set_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
         self.pending_title_generation = None;
         self.title_generation_error = None;
+        self.title_outdated = false;
         if Some(&title) != self.title.as_ref() {
             self.title = Some(title);
             cx.emit(TitleUpdated);

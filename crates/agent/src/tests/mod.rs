@@ -4199,6 +4199,105 @@ async fn test_title_generation(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_title_regenerated_after_first_message_edit(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    let summary_model = fake.model("summary");
+    thread.update(cx, |thread, cx| {
+        thread.set_summarization_model(Some(summary_model.clone()), cx)
+    });
+
+    let first_message_id = ClientUserMessageId::new();
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(first_message_id.clone(), ["Hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hey!");
+    fake.end_last(&model);
+    cx.run_until_parked();
+    let summary_request = fake.pending_completions_for(&summary_model).pop().unwrap();
+    fake.send_text(&summary_model, &summary_request, "First title\n");
+    fake.end_stream(&summary_model, &summary_request);
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
+
+    // Editing a later message keeps the title.
+    let second_message_id = ClientUserMessageId::new();
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(second_message_id.clone(), ["Hello again"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Hey again!");
+    fake.end_last(&model);
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
+    thread
+        .update(cx, |thread, cx| thread.truncate(second_message_id, cx))
+        .unwrap();
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Edited later message"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Edited reply");
+    fake.end_last(&model);
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
+    assert_eq!(fake.pending_completions_for(&summary_model), Vec::new());
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.title(), Some("First title".into()))
+    });
+
+    // Editing the first message generates a new title after the turn.
+    thread
+        .update(cx, |thread, cx| thread.truncate(first_message_id, cx))
+        .unwrap();
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Goodbye"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.title(), Some("First title".into()))
+    });
+    fake.send_last_text(&model, "Bye!");
+    fake.end_last(&model);
+    cx.run_until_parked();
+    let summary_request = fake.pending_completions_for(&summary_model).pop().unwrap();
+    fake.send_text(&summary_model, &summary_request, "Second title\n");
+    fake.end_stream(&summary_model, &summary_request);
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.title(), Some("Second title".into()))
+    });
+
+    // The next turn keeps the new title.
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Goodbye again"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Bye again!");
+    fake.end_last(&model);
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
+    assert_eq!(fake.pending_completions_for(&summary_model), Vec::new());
+}
+
+#[gpui::test]
 async fn test_title_generation_disabled_by_settings(cx: &mut TestAppContext) {
     let ThreadTest {
         model,
